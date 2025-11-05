@@ -267,6 +267,22 @@ public:
 					    const void *transport_connect_msg,
 					    size_t conn_msg_size);
 
+	/**
+	 * @brief Initiate CM cleanup process
+	 * 
+	 * Issues cancellations for all pending RX requests and transitions
+	 * to CLEANUP_INITIATED state. Transport should continue polling CQ
+	 * until is_cleanup_complete() returns true.
+	 */
+	void initiate_cleanup() { resources.initiate_cleanup(); }
+
+	/**
+	 * @brief Check if cleanup is complete
+	 * 
+	 * @return true if safe to destroy CM, false otherwise
+	 */
+	bool is_cleanup_complete() const { return resources.is_cleanup_complete(); }
+
 private:
 	nccl_ofi_cm::cm_resources resources;
 };

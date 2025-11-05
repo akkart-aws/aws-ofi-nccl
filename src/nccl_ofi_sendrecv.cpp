@@ -2159,7 +2159,29 @@ int nccl_net_ofi_sendrecv_domain_t::cleanup_resources()
 	assert(!this->called_cleanup_resources);
 	this->called_cleanup_resources = true;
 
+	// CM cleanup with state machine
 	if (this->cm) {
+		// Initiate cleanup (issues cancellations)
+		this->cm->initiate_cleanup();
+		
+		// Poll CQ until cleanup complete
+		int iterations = 0;
+		const int max_iterations = 1000;  // 1 second timeout (1000 * 1ms)
+		
+		while (!this->cm->is_cleanup_complete() && iterations < max_iterations) {
+			int cq_ret = sendrecv_cq_process(this->cq.get());
+			if (cq_ret != 0) {
+				NCCL_OFI_WARN("Sendrecv domain: CQ processing failed during CM cleanup: %d", cq_ret);
+			}
+			
+			usleep(1000); // 1ms delay between polls
+			iterations++;
+		}
+		
+		if (!this->cm->is_cleanup_complete()) {
+			NCCL_OFI_WARN("Sendrecv domain: CM cleanup timeout after %d iterations", iterations);
+		}
+		
 		delete this->cm;
 		this->cm = nullptr;
 	}

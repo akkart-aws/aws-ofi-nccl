@@ -6615,7 +6615,33 @@ int nccl_net_ofi_rdma_domain_t::cleanup_resources()
 	assert(!this->called_cleanup_resources);
 	this->called_cleanup_resources = true;
 
+	// CM cleanup with state machine
 	if (this->cm) {
+		// Initiate cleanup (issues cancellations)
+		this->cm->initiate_cleanup();
+		
+		// Poll CQ until cleanup complete
+		int iterations = 0;
+		const int max_iterations = 1000;  // 1 second timeout (1000 * 1ms)
+		
+		while (!this->cm->is_cleanup_complete() && iterations < max_iterations) {
+			nccl_net_ofi_ep_t *ep = this->get_endpoint_ptr();
+			if (ep != nullptr) {
+				nccl_net_ofi_rdma_ep_t *rdma_ep = static_cast<nccl_net_ofi_rdma_ep_t *>(ep);
+				int cq_ret = rdma_ep->ofi_process_cq();
+				if (cq_ret != 0) {
+					NCCL_OFI_WARN("RDMA domain: CQ processing failed during CM cleanup: %d", cq_ret);
+				}
+			}
+			
+			usleep(1000); // 1ms delay between polls
+			iterations++;
+		}
+		
+		if (!this->cm->is_cleanup_complete()) {
+			NCCL_OFI_WARN("RDMA domain: CM cleanup timeout after %d iterations", iterations);
+		}
+		
 		delete this->cm;
 		this->cm = nullptr;
 	}

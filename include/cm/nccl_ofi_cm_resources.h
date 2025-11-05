@@ -7,6 +7,7 @@
 
 #include <rdma/fabric.h>
 
+#include <atomic>
 #include <deque>
 #include <mutex>
 #include <stdexcept>
@@ -18,6 +19,19 @@
 #include "ofi/resource_wrapper.h"
 
 namespace nccl_ofi_cm {
+
+/**
+ * @brief CM cleanup state machine
+ * 
+ * ACTIVE: Normal operation, no cleanup in progress
+ * CLEANUP_INITIATED: Cancellations issued, waiting for completion events
+ * CLEANUP_COMPLETE: All cancellations processed, safe to destroy CM
+ */
+enum class cm_cleanup_state {
+	ACTIVE,
+	CLEANUP_INITIATED,
+	CLEANUP_COMPLETE
+};
 
 /**
  * Encapsulates a Libfabric endpoint for use with the CM
@@ -95,6 +109,12 @@ public:
 	 */
 	int recv(nccl_ofi_cm_conn_msg &conn_msg, size_t size, mr_handle_t &mr_handle,
 		 nccl_ofi_cm_req &req);
+
+
+	/**
+	 * Cancel a specific outstanding operation on the endpoint
+	 */
+	int cancel(void *context);
 
 	/**
 	 * Close associated ofi_ep, while leaving other resources open
@@ -220,7 +240,38 @@ public:
 
 	pending_requests_queue pending_reqs_queue;
 
+	/* Cleanup state tracking */
+	std::atomic<size_t> pending_cancellations{0};
+	std::atomic<cm_cleanup_state> cleanup_state{cm_cleanup_state::ACTIVE};
+
 	/* Methods */
+
+	/**
+	 * @brief Initiate CM cleanup process
+	 * 
+	 * Issues cancellations for all pending RX requests and transitions
+	 * to CLEANUP_INITIATED state. Transport should continue polling CQ
+	 * until get_cleanup_state() returns CLEANUP_COMPLETE.
+	 */
+	void initiate_cleanup();
+
+	/**
+	 * @brief Get current cleanup state
+	 * 
+	 * @return Current cleanup state (thread-safe)
+	 */
+	cm_cleanup_state get_cleanup_state() const { 
+		return cleanup_state.load(); 
+	}
+
+	/**
+	 * @brief Check if cleanup is complete
+	 * 
+	 * @return true if safe to destroy CM, false otherwise
+	 */
+	bool is_cleanup_complete() const {
+		return cleanup_state.load() == cm_cleanup_state::CLEANUP_COMPLETE;
+	}
 
 	/**
 	 * Constructor

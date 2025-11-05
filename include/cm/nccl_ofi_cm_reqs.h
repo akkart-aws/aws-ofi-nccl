@@ -43,6 +43,12 @@ public:
 	 */
 	virtual int progress() = 0;
 
+	/**
+	 * To be callaed when the request is cancelled
+	 * @return: 0 (success) or negative errno
+	 */
+	virtual int handle_cancellation() { return 0; }
+
 protected:
 	virtual ~nccl_ofi_cm_req() = default;
 };
@@ -65,6 +71,11 @@ public:
 
 	virtual int handle_completion();
 	virtual int progress();
+
+	/**
+	 * Handle cancellation event during cleanup
+	 */
+	virtual int handle_cancellation();
 
 private:
 	cm_resources &resources;

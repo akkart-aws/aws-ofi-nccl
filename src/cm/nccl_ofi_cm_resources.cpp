@@ -1,5 +1,7 @@
 #include "cm/nccl_ofi_cm_resources.h"
 
+#include <unistd.h>
+
 #include "nccl_ofi_ofiutils.h"
 #include "nccl_ofi_param.h"
 
@@ -152,13 +154,59 @@ cm_resources::cm_resources(nccl_net_ofi_domain_t &domain, size_t _conn_msg_data_
 
 cm_resources::~cm_resources()
 {
-	/* Free all requests. (A unique_ptr would be better here so these can be freed
-	   automatically) */
+	// Check if cleanup was properly completed
+	if (cleanup_state != cm_cleanup_state::CLEANUP_COMPLETE) {
+		NCCL_OFI_WARN("CM destructor: Cleanup was not properly completed (state: %d)", 
+			      static_cast<int>(cleanup_state.load()));
+	}
+	
+	// Provider-specific cleanup order
+	if (!endpoint_mr) {
+		/* Non-FI_MR_ENDPOINT: Close endpoint first, then deregister memory */
+		ep.close_ofi_ep();
+	}
+
 	for (auto &req : rx_reqs) {
 		delete req;
 		req = nullptr;
 	}
 	rx_reqs.clear();
+}
+
+void cm_resources::initiate_cleanup()
+{
+	// Transition to cleanup state
+	cleanup_state = cm_cleanup_state::CLEANUP_INITIATED;
+	
+	if (endpoint_mr) {
+		// Endpoint MR providers: Cancel requests first
+		pending_cancellations = rx_reqs.size();
+		
+		// Issue cancellations for all RX requests
+		for (size_t i = 0; i < rx_reqs.size(); ++i) {
+			auto &req = rx_reqs[i];
+			int ret = ep.cancel(&req->ctx.ofi_ctx);
+			
+			if (ret == -FI_ENOENT) {
+				// Request already completed, decrement pending count
+				pending_cancellations--;
+			} else if (ret != 0) {
+				NCCL_OFI_WARN("CM cleanup: Failed to cancel RX request %zu/%zu: %s", 
+					      i + 1, rx_reqs.size(), fi_strerror(-ret));
+				// Decrement pending count for failed cancels
+				pending_cancellations--;
+			}
+		}
+		
+		// Check if cleanup is already complete (all requests were done/failed)
+		if (pending_cancellations == 0) {
+			cleanup_state = cm_cleanup_state::CLEANUP_COMPLETE;
+		}
+	} else {
+		// Non-Endpoint MR providers: No cancellation needed, cleanup complete immediately
+		pending_cancellations = 0;
+		cleanup_state = cm_cleanup_state::CLEANUP_COMPLETE;
+	}
 }
 
 #define MR_KEY_INIT_VALUE FI_KEY_NOTAVAIL
@@ -277,6 +325,13 @@ int endpoint::recv(nccl_ofi_cm_conn_msg &conn_msg, size_t size, mr_handle_t &mr_
 	return static_cast<int>(ret);
 }
 
+int endpoint::cancel(void *context)
+{
+	if (!ofi_ep.get()) {
+		return -EINVAL;
+	}
+	return fi_cancel(&ofi_ep->fid, context);
+}
 
 void endpoint::close_ofi_ep()
 {

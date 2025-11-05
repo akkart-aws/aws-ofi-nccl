@@ -29,19 +29,23 @@ static inline int cm_req_handle_error_entry(nccl_net_ofi_context_t *ctx,
 {
 	int ret = 0;
 
-	if (err_entry->err == FI_ECANCELED) {
-		/* Closing an EP with posted receives will (erroneously) generate
-		   cancellation events for the posted receives with the EFA provider
-		   in Libfabric versions prior to 1.22. These events are harmless
-		   and can be ignored.
-
-		   With Libfabric 1.22 and later, we shouldn't get these cancel
-		   events at all. The plugin does not explicitly call fi_cancel. */
-		return 0;
-	}
-
 	assert(ctx);
 	nccl_ofi_cm_req *req = cpp_container_of(ctx, &nccl_ofi_cm_req::ctx);
+
+	if (err_entry->err == FI_ECANCELED) {
+		/* Handle cancellation events during cleanup.
+     		 *
+     		 * For FI_MR_ENDPOINT providers, the plugin explicitly calls fi_cancel()
+     		 * during cleanup and expects these cancellation events.
+     		 * 
+     		 * For non-FI_MR_ENDPOINT providers (like EFA), closing an EP with posted 
+     		 * receives may still generate cancellation events in some Libfabric 
+     		 * versions. These events are handled gracefully by checking if cleanup 
+     		 * is in progress (pending_cancellations > 0).
+     		 */
+		req->handle_cancellation();
+		return 0;
+	}
 
 	NCCL_OFI_WARN("Request %p completed with error. RC: %d. Error: %d (%s). Completed length: %ld",
 		req, err_entry->err,
@@ -84,6 +88,21 @@ int nccl_ofi_cm_rx_req::progress()
 	auto conn_msg = static_cast<nccl_ofi_cm_conn_msg *>(rx_elem.ptr);
 	auto mr_handle = static_cast<endpoint::mr_handle_t *>(rx_elem.mr_handle);
 	return resources.ep.recv(*conn_msg, resources.get_conn_msg_size(), *mr_handle, *this);
+}
+
+int nccl_ofi_cm_rx_req::handle_cancellation()
+{
+	if (resources.pending_cancellations > 0) {
+		size_t remaining = --resources.pending_cancellations;
+		
+		// Check if cleanup is now complete
+		if (remaining == 0 && resources.cleanup_state == cm_cleanup_state::CLEANUP_INITIATED) {
+			resources.cleanup_state = cm_cleanup_state::CLEANUP_COMPLETE;
+		}
+	} else {
+		NCCL_OFI_WARN("CM cleanup: Received unexpected cancellation event (pending was already 0)");
+	}
+	return 0;
 }
 
 
