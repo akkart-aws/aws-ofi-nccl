@@ -97,6 +97,12 @@ nccl_ofi_gdrcopy_ctx::nccl_ofi_gdrcopy_ctx()
 		}
 	}
 #endif
+
+	if (forced_pcie_copy() == false) {
+		delete pimpl;
+		throw std::runtime_error(
+			"GDRCopy does not support forced PCIe copy (GDRCopy 2.5+ required)");
+	}
 }
 
 nccl_ofi_gdrcopy_ctx::~nccl_ofi_gdrcopy_ctx()

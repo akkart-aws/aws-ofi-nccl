@@ -14,31 +14,6 @@
 #include "nccl_ofi_tracepoint.h"
 
 /**
- * Context that is shared across all GIN communicators and created during GIN
- * init. It is used to store the GDRCopy device copy context.
- */
-class nccl_ofi_gin_ctx {
-public:
-	/**
-	 * Create a GIN context. This will create a new instance of the GDRCopy
-	 * device copy context
-	 *
-	 * @throw runtime_error if GDRCopy cannot be loaded
-	 */
-	nccl_ofi_gin_ctx();
-
-	~nccl_ofi_gin_ctx();
-
-	nccl_ofi_device_copy &get_device_copy_ctx()
-	{
-		return *copy_ctx;
-	}
-
-private:
-	nccl_ofi_device_copy *copy_ctx;
-};
-
-/**
  * The listen communicator which implements GIN API's nccl_ofi_gin_listen() and
  * nccl_ofi_gin_connect() functionality
  */
@@ -63,8 +38,8 @@ public:
 		}
 	}
 
-	int connect(nccl_ofi_gin_ctx *gin_ctx, nccl_net_ofi_conn_handle_t *handles[], int nranks,
-		    int rank, nccl_ofi_gin_comm **gin_comm_out);
+	int connect(nccl_net_ofi_conn_handle_t *handles[], int nranks, int rank,
+		    nccl_ofi_gin_comm **gin_comm_out);
 };
 
 /**
@@ -168,8 +143,7 @@ struct gin_sym_mr_handle {
 class nccl_ofi_gin_comm {
 public:
 	nccl_ofi_gin_comm(nccl_ofi_gin_resources &resources_arg, int rank_, int nranks_,
-			  nccl_net_ofi_send_comm_t *s_comm_, nccl_net_ofi_recv_comm_t *r_comm_,
-			  nccl_ofi_device_copy &copy_ctx_);
+			  nccl_net_ofi_send_comm_t *s_comm_, nccl_net_ofi_recv_comm_t *r_comm_);
 
 	~nccl_ofi_gin_comm();
 
@@ -309,9 +283,6 @@ private:
 	   TODO: we could also just pass this in the handle to avoid a map
 	   lookup. Not sure yet if that is the right thing to do. */
 	std::unordered_map<void *, gin_sym_mr_handle *> mr_handle_map;
-
-	/* Reference to the context's copy context (created during initialization) */
-	nccl_ofi_device_copy &copy_ctx;
 
 	/* Number of outstanding RDMA writes for signal delivery acknowledgement
 	   Used to wait for remaining acknowledgements on communicator close. */

@@ -30,14 +30,10 @@ static ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogg
 		return ncclInternalError;
 	}
 
-	try {
-		*ctx = new nccl_ofi_gin_ctx();
-	} catch (std::runtime_error &e) {
-		NCCL_OFI_INFO(NCCL_INIT | NCCL_NET,
-			      "Failed to allocate GIN ctx; GDRCopy is likely not available");
-		*ctx = nullptr;
-		return ncclSystemError;
-	}
+	/* GDR copy context is now a singleton, lazily initialized on first use.
+	 * Validation happens in the GDRCopy constructor when first accessed.
+	 * Context parameter is unused but set to non-null to indicate success. */
+	*ctx = (void *)1;
 
 	return ncclSuccess;
 }
@@ -121,8 +117,6 @@ static ncclResult_t nccl_ofi_gin_listen(void *ctx, int dev, void *handle, void *
 static ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks, int rank,
 					 void *listenComm, void **collComm)
 {
-	auto *gin_ctx = static_cast<nccl_ofi_gin_ctx *>(ctx);
-
 	auto *gin_handles = reinterpret_cast<nccl_net_ofi_conn_handle_t **>(handles);
 
 	auto *gin_l_comm = static_cast<nccl_ofi_gin_listen_comm *>(listenComm);
@@ -130,7 +124,7 @@ static ncclResult_t nccl_ofi_gin_connect(void *ctx, void *handles[], int nranks,
 	int ret = 0;
 
 	try {
-		ret = gin_l_comm->connect(gin_ctx, gin_handles, nranks, rank,
+		ret = gin_l_comm->connect(gin_handles, nranks, rank,
 					  reinterpret_cast<nccl_ofi_gin_comm **>(collComm));
 	} catch (const std::exception &e) {
 		NCCL_OFI_WARN("Caught exception in GIN connect: %s", e.what());
@@ -255,7 +249,6 @@ static ncclResult_t nccl_ofi_gin_iput(void *collComm, uint64_t srcOff, void *src
 static ncclResult_t nccl_ofi_gin_finalize(void *ctx)
 {
 	NCCL_OFI_INFO(NCCL_NET | NCCL_INIT, "gin: Finalizing");
-	delete static_cast<nccl_ofi_gin_ctx *>(ctx);
 	return ncclSuccess;
 }
 
