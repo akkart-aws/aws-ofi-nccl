@@ -100,6 +100,9 @@ struct nccl_ofi_gin_peer_rank_info {
 	   track in-use sequence numbers to avoid overflow and only mark
 	   iputSignal complete when it has received the ack from the target,
 	   which has delivered the signal atomic.
+	   
+	   With batched ACK optimization, an ACK for sequence number X clears
+	   flags for all messages in the same batch (64 messages).
 	   */
 	bool active_put_signal[NCCL_OFI_MAX_REQUESTS];
 };
@@ -199,7 +202,20 @@ public:
 
 	bool query_ack_outstanding(uint32_t peer_rank, uint16_t msg_seq_num)
 	{
-		return rank_comms[peer_rank].active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS];
+		/* Batched ACK optimization: Only messages that trigger an ACK need to wait for it.
+		 * Messages at positions 63, 127, 191, 255, ... send ACKs and must wait.
+		 * All other messages can complete immediately without waiting for ACK. */
+		constexpr uint16_t ACK_INTERVAL = 64;
+		bool triggers_ack = ((msg_seq_num + 1) % ACK_INTERVAL == 0);
+		
+		if (triggers_ack) {
+			/* This message triggers an ACK, so it must wait for the ACK */
+			bool outstanding = rank_comms[peer_rank].active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS];
+			return outstanding;
+		} else {
+			/* This message doesn't trigger an ACK, so it can complete immediately */
+			return false;
+		}
 	}
 
 	/* Wait for any outstanding requests as necessary. Should be called before

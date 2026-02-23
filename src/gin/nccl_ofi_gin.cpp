@@ -642,11 +642,24 @@ int nccl_ofi_gin_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint6
 		return ret;
 	}
 
-	/* Write ack */
-	ret = writedata_ack(*this, peer_rank, req->metadata.msg_seq_num);
+	/* Batched ACK optimization: Send ACK only every 64 messages
+	 * to reduce ACK frequency while ensuring we don't overflow the active_put_signal array.
+	 *
+	 * With NCCL_OFI_MAX_REQUESTS=128, we send ACK every 64 messages.
+	 * This means ACK for seq 63, 127, 191, 255, ...
+	 * Each ACK implicitly confirms all previous messages due to in-order delivery. */
+	constexpr uint16_t ACK_INTERVAL = 64;
+	uint16_t seq_num = req->metadata.msg_seq_num;
+	
+	bool should_ack = (seq_num + 1) % ACK_INTERVAL == 0;
+	
+	if (should_ack) {
+		/* Write ack */
+		ret = writedata_ack(*this, peer_rank, seq_num);
 
-	if (ret != 0) {
-		return ret;
+		if (ret != 0) {
+			return ret;
+		}
 	}
 
 	/* Remove this request entry from the map */
@@ -741,9 +754,25 @@ int nccl_ofi_gin_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16
 		NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, msg_seq_num);
 
 		auto &rank_comm = rank_comms[peer_rank];
-		assert_always(rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] ==
-			      true);
-		rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] = false;
+		
+		/* Batched ACK optimization: Clear active flags for all messages confirmed by this ACK.
+		 *
+		 * With NCCL_OFI_MAX_REQUESTS=128 and ACK every 64 messages:
+		 * - ACK for seq 63 confirms messages 0-63
+		 * - ACK for seq 127 confirms messages 64-127
+		 * - ACK for seq 191 confirms messages 128-191 (seq 0-63 reused)
+		 *
+		 * We clear flags for the ACK_INTERVAL messages ending at msg_seq_num. */
+		constexpr uint16_t ACK_INTERVAL = 64;
+		
+		/* Clear flags for the ACK_INTERVAL messages confirmed by this ACK.
+		 * Start from (msg_seq_num - ACK_INTERVAL + 1) to msg_seq_num inclusive. */
+		uint16_t start_seq = (msg_seq_num - ACK_INTERVAL + 1) & GIN_IMM_SEQ_MASK;
+		for (uint16_t i = 0; i < ACK_INTERVAL; ++i) {
+			uint16_t seq = (start_seq + i) & GIN_IMM_SEQ_MASK;
+			assert_always(rank_comm.active_put_signal[seq % NCCL_OFI_MAX_REQUESTS] == true);
+			rank_comm.active_put_signal[seq % NCCL_OFI_MAX_REQUESTS] = false;
+		}
 		return 0;
 	}
 
