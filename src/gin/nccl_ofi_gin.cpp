@@ -10,13 +10,6 @@
 #include "nccl_ofi_gdrcopy.h"
 #include "nccl_ofi_tracepoint.h"
 
-/**
- * The highest value of NSEG is used to flag an ack message
- *
- * TODO something better?
- */
-#define WRITEDATA_ACK_NSEG ((1 << GIN_IMM_NUM_SEG_BITS_SIZE) - 1)
-
 struct gin_connect_handle {
 	/* Number of rails */
 	uint16_t num_rails;
@@ -234,7 +227,7 @@ int nccl_ofi_gin_listen_comm::connect(nccl_net_ofi_conn_handle_t *handles[], int
 }
 
 int nccl_ofi_gin_comm::writedata_ack(nccl_ofi_gin_comm &gin_comm, uint32_t peer_rank,
-				     uint32_t msg_seq_num)
+				     uint32_t ack_seq_num, uint32_t count)
 {
 	/* For now, always send acks on rail 0.
 	   TODO round-robin this like the payload data itself. */
@@ -242,7 +235,7 @@ int nccl_ofi_gin_comm::writedata_ack(nccl_ofi_gin_comm &gin_comm, uint32_t peer_
 
 	auto &rank_comm = gin_comm.rank_comms[peer_rank];
 	uint32_t peer_comm_id = rank_comm.comm_id;
-	uint32_t imm_data = GIN_IMM_GET_IMM_DATA(peer_comm_id, msg_seq_num, WRITEDATA_ACK_NSEG, 0);
+	uint32_t imm_data = GIN_IMM_ACK_DATA(peer_comm_id, ack_seq_num, count);
 
 	auto &ep = gin_comm.resources.get_ep();
 
@@ -252,7 +245,7 @@ int nccl_ofi_gin_comm::writedata_ack(nccl_ofi_gin_comm &gin_comm, uint32_t peer_
 		gin_comm, ofi_ep, rail_id, imm_data, rank_comm.address[rail_id],
 		rank_comm.write_ack_buff_addr_offset, rank_comm.write_ack_buff_mr_key[rail_id]);
 
-	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, msg_seq_num);
+	NCCL_OFI_TRACE_GIN_ACK_SEND(dev, rail_id, &gin_comm, peer_rank, ack_seq_num);
 
 	int ret = req->post();
 	if (ret == -FI_EAGAIN) {
@@ -471,7 +464,7 @@ int nccl_ofi_gin_comm::iputSignal(uint64_t srcOff, gin_sym_mr_handle *srcMhandle
 		nseg += schedule->num_xfer_infos;
 		assert_always(nseg > 0);
 
-		uint64_t data = GIN_IMM_GET_IMM_DATA(remote_comm_id, msg_seq_num, nseg, is_ack_requested);
+		uint64_t data = GIN_IMM_SEG_DATA(remote_comm_id, msg_seq_num, nseg, is_ack_requested);
 
 		auto &dest_remote_mr = dstMhandle->remote_mr[dst_rank];
 		uint64_t dest = dest_remote_mr.address_offset + dstOff;
@@ -659,14 +652,6 @@ int nccl_ofi_gin_comm::iput_signal_recv_req_completion(uint32_t peer_rank, uint6
 		return ret;
 	}
 
-	/* Send ACK only if this message requested one */
-	if (req->is_ack_requested) {
-		ret = writedata_ack(*this, peer_rank, req->metadata.msg_seq_num);
-		if (ret != 0) {
-			return ret;
-		}
-	}
-
 	/* Remove this request entry from the map */
 	size_t n_removed = this->outstanding_iput_signal_recv_reqs.erase(map_key);
 	assert_always(n_removed == 1);
@@ -679,15 +664,35 @@ int nccl_ofi_gin_comm::iput_signal_deliver_all(uint32_t peer_rank)
 	int ret = 0;
 
 	/* Process undelivered signals in order */
+	uint16_t highest_acked_seq_num = 0;
+	uint16_t first_acked_seq_num = 0;
+	bool any_ack_requested = false;
+
 	while (true) {
 		auto &rank_comm = this->rank_comms[peer_rank];
 		uint16_t next_seq_num = rank_comm.next_delivered_signal_seq_num;
+
+		/* If delivering this signal would overflow the ack_count field,
+		   stop and send the ACK for what we have so far. The remaining
+		   signals will be delivered on the next call. */
+		if (any_ack_requested) {
+			uint32_t count = ((next_seq_num - first_acked_seq_num + 1) & GIN_IMM_SEQ_MASK);
+			if (count > 0x3FF)
+				break;
+		}
+
 		uint64_t map_key = get_req_map_key(peer_rank, next_seq_num);
 		auto it = this->outstanding_iput_signal_recv_reqs.find(map_key);
 		if (it != this->outstanding_iput_signal_recv_reqs.end()) {
 			auto *req = it->second;
 
 			if (req->num_seg_completions == req->total_segments) {
+				if (req->is_ack_requested) {
+					if (!any_ack_requested)
+						first_acked_seq_num = next_seq_num;
+					any_ack_requested = true;
+					highest_acked_seq_num = next_seq_num;
+				}
 				rank_comm.next_delivered_signal_seq_num =
 					(rank_comm.next_delivered_signal_seq_num + 1) &
 					GIN_IMM_SEQ_MASK;
@@ -707,6 +712,17 @@ int nccl_ofi_gin_comm::iput_signal_deliver_all(uint32_t peer_rank)
 			/* No more signals to deliver */
 			break;
 		}
+	}
+
+	/* Send one range ACK covering all ack-requested signals delivered in
+	   this call, instead of one ACK per signal. deliver_all walks the
+	   contiguous deliverable range, so first_acked and highest_acked
+	   bound the range. Seq_nums in between that did not request an ACK
+	   are harmlessly skipped on the sender side (they never set
+	   ack_outstanding). */
+	if (any_ack_requested) {
+		uint32_t count = ((highest_acked_seq_num - first_acked_seq_num + 1) & GIN_IMM_SEQ_MASK);
+		ret = writedata_ack(*this, peer_rank, highest_acked_seq_num, count);
 	}
 
 	return ret;
@@ -748,21 +764,37 @@ int nccl_ofi_gin_comm::handle_signal_metadata_completion(
 }
 
 int nccl_ofi_gin_comm::handle_signal_write_completion(fi_addr_t src_addr, uint16_t rail_id,
-						      uint16_t msg_seq_num, uint64_t total_segms,
-						      bool is_ack_requested, size_t len)
+						      bool is_ack_msg, uint16_t msg_seq_num,
+						      uint64_t total_segms, size_t len,
+						      bool is_ack_requested, uint16_t ack_count)
 {
 	int ret = 0;
 
 	uint32_t peer_rank = get_peer_rank(src_addr, rank_map[rail_id]);
-	if (total_segms == WRITEDATA_ACK_NSEG) {
+	if (is_ack_msg) {
 		assert(len == 0);
 
-		NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, msg_seq_num);
+		/* Self-contained range ACK: clear ack_outstanding from start_seq
+		   to ack_seq_num. Each ACK carries ack_seq_num and a count so
+		   the sender needs no cumulative state (e.g. last_acked_seq_num).
+		   This is critical because EFA does not guarantee fi_writedata
+		   ordering — ACKs from different deliver_all calls can arrive
+		   in any order. A single ack_seq_num would require cumulative
+		   state that breaks under reordering. */
+		uint16_t ack_seq_num = msg_seq_num;
+		uint16_t start_seq = (ack_seq_num - ack_count + 1) & GIN_IMM_SEQ_MASK;
 
-		auto &rank_comm = rank_comms[peer_rank];
-		assert_always(rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] ==
-			      true);
-		rank_comm.active_put_signal[msg_seq_num % NCCL_OFI_MAX_REQUESTS] = false;
+		NCCL_OFI_TRACE_GIN_ACK_RECV(dev, rail_id, this, peer_rank, ack_seq_num);
+
+		uint16_t seq = start_seq;
+		while (true) {
+			if (query_ack_outstanding(peer_rank, seq)) {
+				clear_ack_outstanding(peer_rank, seq);
+			}
+			if (seq == ack_seq_num)
+				break;
+			seq = (seq + 1) & GIN_IMM_SEQ_MASK;
+		}
 		return 0;
 	}
 
