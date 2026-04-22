@@ -167,3 +167,25 @@ jobs:
             ENABLE_CUDA=${{ matrix.sdk == 'cuda' }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+  cleanup-stale-images:
+    needs: [build-amazonlinux-containers, build-ubuntu2204-containers, build-ubuntu2404-containers, build-codechecker-containers]
+    runs-on: ubuntu-latest
+    permissions:
+      packages: write
+    strategy:
+      matrix:
+        image:
+          - aws-ofi-nccl-al2023
+          - aws-ofi-nccl-ubuntu
+          - aws-ofi-nccl-ubuntu2404
+          - aws-ofi-nccl-codechecker
+    steps:
+      - uses: snok/container-retention-policy@v3.0.0
+        with:
+          account: aws
+          token: ${{ secrets.GITHUB_TOKEN }}
+          image-names: ${{ matrix.image }}
+          tag-selection: untagged
+          cut-off: 1w
+          dry-run: false
