@@ -20,6 +20,7 @@
 #include "nccl_ofi_param.h"
 
 #if HAVE_DECL_FI_EFA_GDA_OPS
+#include <algorithm>
 #include <memory>
 #include <vector>
 
@@ -104,7 +105,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 {
 #if !HAVE_DECL_FI_EFA_GDA_OPS
 	(void)collComm;
-	(void)config;
+	(void)config; /* used below when HAVE_FI_EFA_COMP_CNTR */
 	(void)ginCtx;
 	(void)devHandle;
 	return gdaki_not_supported("createContext");
@@ -171,6 +172,7 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 * to the proxy's fabric + domain name.
 		 */
 		ctx->endpoint.open(ofi_domain, proxy_info, ofi_nccl_cq_size());
+		ctx->endpoint.enable();
 
 		/*
 		 * Step 3: Open FI_EFA_GDA_OPS on the reused domain and query
@@ -251,7 +253,74 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		ctx->peers.populate(ctx->endpoint, all_addrs, ep_addr_len, nranks, gda_ops);
 
 		/*
-		 * Step 7: Populate and upload the device-visible handle.
+		 * Step 7: Create signal/counter endpoints if requested.
+		 */
+#if HAVE_FI_EFA_COMP_CNTR
+		int n_sc = std::max(config->nSignals, config->nCounters);
+		if (n_sc > 0) {
+			ctx->nSignals = config->nSignals;
+			ctx->nCounters = config->nCounters;
+			ctx->sc_endpoints.reserve(n_sc);
+
+			for (int i = 0; i < n_sc; i++) {
+				ctx->sc_endpoints.push_back(std::make_unique<gdaki_sc_endpoint>());
+				ctx->sc_endpoints[i]->open(ofi_domain, proxy_info, gda_ops);
+
+				/* Allgather this sc endpoint's address */
+				std::vector<uint8_t> sc_addrs(nranks * ep_addr_len, 0);
+				size_t sc_addrlen = ep_addr_len;
+				ret = fi_getname(&ctx->sc_endpoints[i]->endpoint.ep->fid,
+						 &sc_addrs[rank * ep_addr_len], &sc_addrlen);
+				if (ret != 0)
+					throw std::runtime_error("fi_getname for sc endpoint failed");
+
+				ret = put_comm->get_ag_comm().all_gather(sc_addrs.data(), ep_addr_len);
+				if (ret != 0)
+					throw std::runtime_error("allgather of sc endpoint addresses failed");
+
+				ctx->sc_endpoints[i]->create(gda_ops, sc_addrs, ep_addr_len, nranks);
+			}
+
+			/* Build counter_handles GPU array */
+			if (config->nCounters > 0) {
+				ctx->d_counter_handles.allocate(config->nCounters);
+				for (int i = 0; i < config->nCounters; i++) {
+					/* Patch cntr_value on the counter dev_handle to FI_WRITE counter.
+					 * This is a separate struct from the signal dev_handle, so
+					 * patching it does not clobber the signal cntr_value. */
+					volatile uint64_t *ptr = ctx->sc_endpoints[i]->write_cntr.gpu_ptr();
+					size_t offset = offsetof(nccl_ofi_gin_dev_counter_handle, cntr_value);
+					if (nccl_net_ofi_gpu_mem_copy_host_to_device(
+						    reinterpret_cast<uint8_t *>(ctx->sc_endpoints[i]->counter_dev_handle.dev) + offset,
+						    &ptr, sizeof(ptr)) != 0)
+						throw std::runtime_error("patch counter cntr_value failed");
+
+					ctx->d_counter_handles.host[i] = ctx->sc_endpoints[i]->counter_dev_handle.dev;
+				}
+				ctx->d_counter_handles.commit();
+			}
+
+			/* Build signal_handles GPU array */
+			if (config->nSignals > 0) {
+				ctx->d_signal_handles.allocate(config->nSignals);
+				for (int i = 0; i < config->nSignals; i++) {
+					/* Patch cntr_value on the signal dev_handle to FI_REMOTE_WRITE counter. */
+					volatile uint64_t *ptr = ctx->sc_endpoints[i]->remote_write_cntr.gpu_ptr();
+					size_t offset = offsetof(nccl_ofi_gin_dev_counter_handle, cntr_value);
+					if (nccl_net_ofi_gpu_mem_copy_host_to_device(
+						    reinterpret_cast<uint8_t *>(ctx->sc_endpoints[i]->signal_dev_handle.dev) + offset,
+						    &ptr, sizeof(ptr)) != 0)
+						throw std::runtime_error("patch signal cntr_value failed");
+
+					ctx->d_signal_handles.host[i] = ctx->sc_endpoints[i]->signal_dev_handle.dev;
+				}
+				ctx->d_signal_handles.commit();
+			}
+		}
+#endif /* HAVE_FI_EFA_COMP_CNTR */
+
+		/*
+		 * Step 8: Populate and upload the device-visible handle.
 		 */
 		ctx->dev_handle.allocate(1);
 		nccl_ofi_gin_gdaki_dev_handle &h = *ctx->dev_handle.host;
@@ -260,6 +329,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		h.address_handles = ctx->peers.ahs.dev;
 		h.remote_qpns = ctx->peers.qpns.dev;
 		h.qkey = ctx->peers.qkeys.dev;
+		h.counter_handles = (config->nCounters > 0) ?
+			ctx->d_counter_handles.dev : nullptr;
+		h.signal_handles = (config->nSignals > 0) ?
+			ctx->d_signal_handles.dev : nullptr;
 		h.pending_reqs = 0;
 		h.nranks = nranks;
 		h.rank = rank;
