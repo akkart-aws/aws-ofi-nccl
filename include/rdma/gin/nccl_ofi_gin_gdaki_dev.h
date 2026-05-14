@@ -31,15 +31,42 @@ extern "C" {
  * The rkeys array (one per rank) is used for remote RDMA write destinations.
  * The kernel receives this as a ncclGinWindow_t (void*).
  */
+/**
+ * Per-peer MR metadata used by EFA GDA WQE construction.
+ *
+ * EFA uses FI_MR_VIRT_ADDR, so WQEs take absolute virtual addresses for
+ * both local and remote buffers. The kernel passes an offset (srcOff /
+ * dstOff) and we compute the absolute address by adding the base VA.
+ */
+struct nccl_ofi_gin_gdaki_mr_peer {
+	/* Remote rank's base virtual address for this MR. */
+	uint64_t remote_addr;
+	/* Remote rank's rkey for this MR. */
+	uint32_t rkey;
+	/* Padding to keep the struct 16-byte sized for natural alignment. */
+	uint32_t pad;
+};
+
+/**
+ * Device-visible handle for a single MR registered by regMrSym.
+ *
+ * Returned (as an opaque pointer) from regMrSym's ginHandle output. The
+ * device code casts this pointer and reads fields directly in GPU memory.
+ * Layout is shared with the NCCL mirror in
+ * nccl_device/gin/efa_gda/gin_efa_gda_dev.h — keep them in sync.
+ */
 struct nccl_ofi_gin_gdaki_mr_handle {
 	/* Local key for this MR on the efa-direct domain. */
 	uint32_t lkey;
 
-	/* Number of ranks (size of rkeys array). */
+	/* Number of ranks (size of peers[] array). */
 	int32_t nranks;
 
-	/* Per-peer remote keys, indexed by rank. [nranks] elements follow. */
-	uint32_t rkeys[];
+	/* Local (this rank's) base virtual address for this MR. */
+	uint64_t local_addr;
+
+	/* Per-peer remote metadata. [nranks] elements follow. */
+	struct nccl_ofi_gin_gdaki_mr_peer peers[];
 };
 
 /**
@@ -173,6 +200,20 @@ struct nccl_ofi_gin_gdaki_dev_handle {
 	/* Count of outstanding requests tracked on the device. Used by Flush.
 	 * Initialized to 0. */
 	uint64_t pending_reqs;
+
+	/* Spinlock for serializing SQ WQE posting across multiple concurrent
+	 * threads in the same CTA / across CTAs. efa-dp-direct's WQE posting
+	 * functions are not thread-safe on their own. Initialized to 0. */
+	uint32_t sq_lock;
+
+	/* Padding to keep downstream fields 8-byte aligned. */
+	uint32_t sq_lock_pad;
+
+	/* Number of counter_handles entries. 0 means counter_handles is NULL. */
+	int32_t nCounters;
+
+	/* Number of signal_handles entries. 0 means signal_handles is NULL. */
+	int32_t nSignals;
 
 	/* Number of ranks participating in this context. */
 	int32_t nranks;

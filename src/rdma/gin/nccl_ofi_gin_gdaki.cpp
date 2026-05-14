@@ -304,7 +304,6 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			if (config->nSignals > 0) {
 				ctx->d_signal_handles.allocate(config->nSignals);
 				for (int i = 0; i < config->nSignals; i++) {
-					/* Patch cntr_value on the signal dev_handle to FI_REMOTE_WRITE counter. */
 					volatile uint64_t *ptr = ctx->sc_endpoints[i]->remote_write_cntr.gpu_ptr();
 					size_t offset = offsetof(nccl_ofi_gin_dev_counter_handle, cntr_value);
 					if (nccl_net_ofi_gpu_mem_copy_host_to_device(
@@ -334,6 +333,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		h.signal_handles = (config->nSignals > 0) ?
 			ctx->d_signal_handles.dev : nullptr;
 		h.pending_reqs = 0;
+		h.sq_lock = 0;
+		h.sq_lock_pad = 0;
+		h.nCounters = config->nCounters;
+		h.nSignals = config->nSignals;
 		h.nranks = nranks;
 		h.rank = rank;
 		ctx->dev_handle.commit();
@@ -458,9 +461,9 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size
 	uint32_t lkey = (uint32_t)gda_ops->get_mr_lkey(mr);
 
 	/* Step 4/5: allocate and populate the device-visible handle.
-	 * Layout: base struct + flex rkeys[nranks]. */
+	 * Layout: base struct + flex peers[nranks]. */
 	size_t handle_size = sizeof(nccl_ofi_gin_gdaki_mr_handle) +
-			     (size_t)nranks * sizeof(uint32_t);
+			     (size_t)nranks * sizeof(nccl_ofi_gin_gdaki_mr_peer);
 	auto *gdaki_handle = static_cast<nccl_ofi_gin_gdaki_mr_handle *>(
 		calloc(1, handle_size));
 	if (gdaki_handle == nullptr) {
@@ -470,10 +473,13 @@ static ncclResult_t nccl_ofi_gin_gdaki_regMrSym(void *collComm, void *data, size
 
 	gdaki_handle->lkey = lkey;
 	gdaki_handle->nranks = nranks;
+	gdaki_handle->local_addr = (uint64_t)data;
 	for (int i = 0; i < nranks; i++) {
-		/* remote_mr[i].mr_key[0] is the peer rkey on rail 0, stored
-		 * by the shared regMrSymDmaBuf after its internal allgather. */
-		gdaki_handle->rkeys[i] = (uint32_t)sym->remote_mr[i].mr_key[0];
+		/* remote_mr[i].address is the peer's base VA allgathered by
+		 * the shared regMrSym. remote_mr[i].mr_key[0] is the peer's
+		 * rkey on rail 0. */
+		gdaki_handle->peers[i].remote_addr = (uint64_t)sym->remote_mr[i].address;
+		gdaki_handle->peers[i].rkey        = (uint32_t)sym->remote_mr[i].mr_key[0];
 	}
 
 	/* Stash on the mhandle so deregMrSym can free it. The mhandle and
