@@ -164,6 +164,29 @@ struct nccl_ofi_gin_dev_counter_handle {
 	uint16_t *address_handles;
 	uint16_t *remote_qpns;
 	uint32_t *qkey;
+
+	/* Per-QP spinlock used by the device-side WQE post path. efa-dp-direct's
+	 * start_sq_batch / sq_batch_place_wr / flush_sq_wrs sequence must be
+	 * serialized per QP (per the efa-dp-direct CUDA README). One lock here
+	 * lets multiple CTAs posting on different signal endpoints proceed in
+	 * parallel; only CTAs targeting the same endpoint contend. */
+	uint32_t sq_lock;
+	uint32_t sq_lock_pad;
+
+	/* Counter-based completion tracking (replaces CQ poll in Flush).
+	 *
+	 * `local_cntr_value` points at the FI_WRITE hardware counter for this
+	 * endpoint's QP. The NIC increments it on every locally-completed
+	 * outgoing WR (regardless of remote semantics). The kernel reads it
+	 * directly from GPU memory.
+	 *
+	 * `submitted_count` is incremented by the device under the sq_lock
+	 * after a successful flush_sq_wrs. Flush waits until
+	 * *local_cntr_value >= submitted_count, i.e., all WRs we have submitted
+	 * on this QP have completed locally. No CQ poll/pop — the firmware
+	 * counter is the source of truth. */
+	volatile uint64_t *local_cntr_value;
+	uint64_t submitted_count;
 };
 
 /**
