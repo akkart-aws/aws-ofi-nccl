@@ -257,12 +257,15 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		 */
 #if HAVE_FI_EFA_COMP_CNTR
 		int n_sc = std::max(config->nSignals, config->nCounters);
+		// NCCL_OFI_INFO(NCCL_NET, "GDAKI createContext: rank=%d nSignals=%d nCounters=%d nContexts=%d -> n_sc=%d (each sc_endpoint allocates 2 hw counters)",
+		//               rank, config->nSignals, config->nCounters, config->nContexts, n_sc);
 		if (n_sc > 0) {
 			ctx->nSignals = config->nSignals;
 			ctx->nCounters = config->nCounters;
 			ctx->sc_endpoints.reserve(n_sc);
 
 			for (int i = 0; i < n_sc; i++) {
+				// NCCL_OFI_INFO(NCCL_NET, "GDAKI createContext: opening sc_endpoint %d/%d", i, n_sc);
 				ctx->sc_endpoints.push_back(std::make_unique<gdaki_sc_endpoint>());
 				ctx->sc_endpoints[i]->open(ofi_domain, proxy_info, gda_ops);
 
@@ -315,6 +318,72 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 				}
 				ctx->d_signal_handles.commit();
 			}
+
+			/*
+			 * Step 7.5: Allocate signal-only scratch buffer and
+			 * allgather (addr, rkey) per rank. The GPU kernel uses
+			 * these for net.signal()-style writes that have no data
+			 * (hasWins=false, bytes=0) — EFA still needs a real remote
+			 * address to bump the receiver's FI_REMOTE_WRITE counter.
+			 */
+			{
+				constexpr size_t kScratchBytes = sizeof(uint64_t);
+				ctx->scratch_buf = calloc(1, kScratchBytes);
+				if (ctx->scratch_buf == nullptr) {
+					throw std::runtime_error("scratch calloc failed");
+				}
+
+				struct iovec iov = { .iov_base = ctx->scratch_buf,
+				                     .iov_len = kScratchBytes };
+				struct fi_mr_attr mr_attr = {};
+				mr_attr.mr_iov = &iov;
+				mr_attr.iov_count = 1;
+				mr_attr.access = FI_REMOTE_WRITE | FI_WRITE | FI_SEND | FI_RECV;
+				mr_attr.iface = FI_HMEM_SYSTEM;
+
+				int mret = fi_mr_regattr(ofi_domain, &mr_attr, 0,
+				                         &ctx->scratch_mr);
+				if (mret != 0) {
+					throw std::runtime_error(
+						"scratch fi_mr_regattr failed: " +
+						std::string(fi_strerror(-mret)));
+				}
+
+				ctx->scratch_lkey = (uint32_t)fi_mr_key(ctx->scratch_mr);
+				ctx->scratch_local_addr = (uint64_t)ctx->scratch_buf;
+
+				// NCCL_OFI_INFO(NCCL_NET,
+				//               "GDAKI scratch: rank=%d addr=0x%lx lkey=0x%x",
+				//               rank,
+				//               (unsigned long)ctx->scratch_local_addr,
+				//               ctx->scratch_lkey);
+
+				/* Allgather (local_addr, local_rkey) across ranks. */
+				std::vector<uint64_t> scratch_all_addrs(nranks, 0);
+				std::vector<uint32_t> scratch_all_rkeys(nranks, 0);
+				scratch_all_addrs[rank] = ctx->scratch_local_addr;
+				scratch_all_rkeys[rank] = ctx->scratch_lkey;
+
+				if (put_comm->get_ag_comm().all_gather(
+					    scratch_all_addrs.data(), sizeof(uint64_t)) != 0) {
+					throw std::runtime_error(
+						"scratch allgather addrs failed");
+				}
+				if (put_comm->get_ag_comm().all_gather(
+					    scratch_all_rkeys.data(), sizeof(uint32_t)) != 0) {
+					throw std::runtime_error(
+						"scratch allgather rkeys failed");
+				}
+
+				ctx->scratch_remote_addrs_buf.allocate(nranks);
+				ctx->scratch_remote_rkeys_buf.allocate(nranks);
+				for (int i = 0; i < nranks; i++) {
+					ctx->scratch_remote_addrs_buf.host[i] = scratch_all_addrs[i];
+					ctx->scratch_remote_rkeys_buf.host[i] = scratch_all_rkeys[i];
+				}
+				ctx->scratch_remote_addrs_buf.commit();
+				ctx->scratch_remote_rkeys_buf.commit();
+			}
 		}
 #endif /* HAVE_FI_EFA_COMP_CNTR */
 
@@ -339,6 +408,20 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		h.nSignals = config->nSignals;
 		h.nranks = nranks;
 		h.rank = rank;
+
+#if HAVE_FI_EFA_COMP_CNTR
+		h.scratch_lkey = ctx->scratch_lkey;
+		h.scratch_pad = 0;
+		h.scratch_local_addr = ctx->scratch_local_addr;
+		h.scratch_remote_addrs = ctx->scratch_remote_addrs_buf.dev;
+		h.scratch_remote_rkeys = ctx->scratch_remote_rkeys_buf.dev;
+#else
+		h.scratch_lkey = 0;
+		h.scratch_pad = 0;
+		h.scratch_local_addr = 0;
+		h.scratch_remote_addrs = nullptr;
+		h.scratch_remote_rkeys = nullptr;
+#endif
 		ctx->dev_handle.commit();
 
 		/*
