@@ -1,3 +1,13 @@
+# 1.21.0~alpha2 (July 2026, pre-release)
+
+Internal pre-release of the OFI NCCL Plugin 1.21 line for the EFA dev
+installer 1.50.0 (Nvidia GIN GDAKI / counting-events testing). Same source
+as 1.21.0~alpha1 (aws-ofi-nccl master @ cb33a4c) plus a packaging fix:
+pass --enable-gdaki in the debian rules and RPM spec so the installer's
+pipeline-built plugin binaries actually contain the GDAKI backend
+(1.21.0~alpha1 binaries were compiled with GDAKI stubbed out). Not a
+public release.
+
 # 1.21.0~alpha1 (July 2026, pre-release)
 
 Internal pre-release of the OFI NCCL Plugin 1.21 line for the EFA dev

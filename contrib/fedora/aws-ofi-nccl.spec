@@ -35,6 +35,7 @@ while running NCCL applications.
            --sysconfdir=%{_prefix}/conf \
            --with-cuda=/usr/local/cuda \
            --enable-cudart-dynamic \
+           --enable-gdaki \
            --with-libfabric=/opt/amazon/efa \
            --disable-werror \
            --disable-tests \

@@ -31,6 +31,7 @@ override_dh_auto_configure:
 		--enable-platform-aws \
 		--with-cuda=/usr/local/cuda \
 		--enable-cudart-dynamic \
+		--enable-gdaki \
 		--disable-tests \
 		--without-lttng \
 		--without-valgrind \
@@ -43,6 +44,7 @@ override_dh_auto_configure:
 		--enable-platform-aws \
 		--with-cuda=/usr/local/cuda \
 		--enable-cudart-dynamic \
+		--enable-gdaki \
 		--disable-tests \
 		--without-lttng \
 		--without-valgrind \
@@ -57,6 +59,7 @@ override_dh_auto_configure:
 		--enable-platform-aws \
 		--with-cuda=/usr/local/cuda \
 		--enable-cudart-dynamic \
+		--enable-gdaki \
 		--disable-tests \
 		--without-lttng \
 		--without-valgrind \
@@ -70,6 +73,7 @@ override_dh_auto_configure:
 		--enable-platform-aws \
 		--with-cuda=/usr/local/cuda \
 		--enable-cudart-dynamic \
+		--enable-gdaki \
 		--disable-tests \
 		--without-lttng \
 		--without-valgrind \
