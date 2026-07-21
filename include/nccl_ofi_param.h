@@ -381,12 +381,14 @@ OFI_NCCL_PARAM(NVTX_TRACE_DIMENSION, nvtx_trace_dimension,  "NVTX_TRACE_DIMENSIO
  *   GDAKI: kernel-initiated GDAKI mode; requires plugin built with
  *          --enable-gdaki
  *
- * Default is proxy mode. Setting this to GDAKI on a plugin built without
- * GDAKI support causes plugin init to fail with ncclInvalidUsage rather
- * than silently falling back.
+ * Default is GDAKI so installer builds (--enable-gdaki) engage the
+ * kernel-initiated path with no runtime configuration. On a plugin built
+ * without GDAKI support the default falls back to proxy mode; an explicit
+ * OFI_NCCL_GIN_TYPE=GDAKI on such a build still fails init with
+ * ncclInvalidUsage (explicit opt-in must not be ignored).
  */
 OFI_NCCL_PARAM_VALUE_SET(GIN_TYPE, (PROXY)(GDAKI))
-OFI_NCCL_PARAM(GIN_TYPE, gin_type, "GIN_TYPE", GIN_TYPE::PROXY)
+OFI_NCCL_PARAM(GIN_TYPE, gin_type, "GIN_TYPE", GIN_TYPE::GDAKI)
 
 /*
  * Enable strong-signal semantics for the GIN plugin.

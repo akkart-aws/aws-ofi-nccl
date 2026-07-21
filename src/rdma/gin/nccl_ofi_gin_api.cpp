@@ -88,10 +88,21 @@ ncclResult_t nccl_ofi_gin_init(void **ctx, uint64_t commId, ncclDebugLogger_t lo
 	 * compile time, so to engage GDAKI we just overwrite the exported
 	 * symbol.
 	 *
-	 * If the user requested GDAKI but the plugin was built without
-	 * --enable-gdaki, fail init rather than silently falling back: GDAKI
-	 * was an explicit opt-in.
+	 * GDAKI is the default. On a build without --enable-gdaki the
+	 * default downgrades to PROXY (writing the param back so the
+	 * libfabric API-version selection elsewhere agrees), but an explicit
+	 * OFI_NCCL_GIN_TYPE=GDAKI request must not be silently ignored and
+	 * still fails init.
 	 */
+#if !HAVE_GDAKI
+	if (ofi_nccl_gin_type.get_source() != ParamSource::ENVIRONMENT) {
+		if (ofi_nccl_gin_type.set(GIN_TYPE::PROXY) == 0) {
+			NCCL_OFI_INFO(NCCL_NET | NCCL_INIT,
+				      "gin: built without GDAKI support; "
+				      "defaulting to proxy mode");
+		}
+	}
+#endif
 	switch (ofi_nccl_gin_type.get()) {
 	case GIN_TYPE::PROXY:
 		break;
