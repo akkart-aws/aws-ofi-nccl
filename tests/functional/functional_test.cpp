@@ -421,6 +421,16 @@ test_nccl_gin_t *get_ginPlugin_symbol(void *netPluginLib)
 	return extGin;
 }
 
+test_nccl_gin_gdaki_t *get_ginPlugin_gdaki_symbol(void *netPluginLib)
+{
+	test_nccl_gin_gdaki_t *extGin = (test_nccl_gin_gdaki_t *)dlsym(netPluginLib, STR(NCCL_GIN_PLUGIN_SYMBOL_GDAKI));
+	if (extGin == NULL) {
+		NCCL_OFI_WARN("GinPlugin, could not find %s symbol",
+			      STR(NCCL_GIN_PLUGIN_SYMBOL_GDAKI));
+	}
+	return extGin;
+}
+
 
 test_nccl_net_t *get_extNet(void)
 {

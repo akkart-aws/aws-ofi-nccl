@@ -9,7 +9,7 @@
  * createContext / destroyContext orchestrate via the composed type.
  *
  * Plugin-owned GPU buffers and MMIO mappings use the accelerator
- * abstraction (nccl_net_ofi_gpu_*). Canonical QP/CQ descriptors instead
+ * abstraction (nccl_net_ofi_gpu_*). Canonical QP descriptors instead
  * delegate allocation and destruction to the pinned efa-dp-direct host
  * API, which uses the CUDA Runtime API. The GDAKI code path is CUDA-only.
  */
@@ -20,6 +20,8 @@
 #include "config.h"
 
 #include <array>
+#include <atomic>
+#include <cstddef>
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
@@ -35,6 +37,7 @@
 #include <rdma/fi_ext_efa.h>
 
 #include "nccl_ofi_cuda.h"
+#include "nccl_ofi_device_copy.h"
 #include "rdma/gin/nccl_ofi_gin_gdaki_dev.h"
 
 /**
@@ -153,8 +156,9 @@ public:
 /**
  * A libfabric endpoint opened on a borrowed domain.
  *
- * Owns: fid_ep, fid_cq, fid_av, fi_info.
- * Borrows: fid_domain (caller is responsible for its lifetime).
+ * Owns: fid_ep, fid_av, fi_info.
+ * Borrows: fid_domain (caller is responsible for its lifetime). open() binds a
+ * caller-provided cq to the EP; the caller owns and closes it.
  *
  * The fi_info is obtained via fi_getinfo narrowed by the reference
  * info's fabric and domain names, so the EP is constrained to the
@@ -163,7 +167,6 @@ public:
 class gdaki_fi_endpoint {
 public:
 	struct fid_ep *ep = nullptr;
-	struct fid_cq *cq = nullptr;
 	struct fid_av *av = nullptr;
 	struct fi_info *info = nullptr;
 
@@ -176,9 +179,6 @@ public:
 		if (ep) {
 			fi_close(&ep->fid);
 		}
-		if (cq) {
-			fi_close(&cq->fid);
-		}
 		if (av) {
 			fi_close(&av->fid);
 		}
@@ -188,12 +188,12 @@ public:
 	}
 
 	/*
-	 * Open EP + CQ + AV on `domain`, bind CQ and AV.
+	 * Open EP + AV on `domain`, bind `cq` and AV.
 	 * Does NOT enable — caller must call enable() after any
 	 * additional binds (e.g. counters).
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  size_t cq_size);
+		  struct fid_cq *cq);
 
 	/*
 	 * Enable the endpoint. Must be called after open() and
@@ -297,34 +297,61 @@ private:
 	efa_cuda_qp *qp = nullptr;
 };
 
+class gdaki_completion_state;
+
 /**
- * A GPU-resident canonical efa_cuda_cq descriptor.
+ * A libfabric completion queue plus the host-side cursor to drain it.
  *
- * Owns the descriptor created through the pinned efa-dp-direct host API.
- * `build()` is deliberately single-use: each host API create call allocates a
- * fresh GPU descriptor, and the destructor calls the paired destroy function.
- * On P5en the CQ buffer is polled via its host pointer rather than through a
- * GPU-mapped MMIO region; IOMEMORY|DEVICEMAP registration of the CQ BAR
- * fails, and the host pointer is usable from both CPU and CUDA kernels.
+ * Owns: fid_cq, opened on a borrowed domain.
+ * Borrows: fid_domain; the caller owns its lifetime.
+ *
+ * open() creates the CQ. populate() queries its geometry through gda_ops. The
+ * progress pass walks this CQ's ring from the consumer cursor kept here; each
+ * CQE is a local TX completion whose req_id encodes a peer and a per-peer
+ * sequence number. The per-peer completion state and the error detail live in
+ * the context-wide gdaki_completion_state.
  */
-class gdaki_gpu_cq {
+class gdaki_host_cq {
 public:
-	gdaki_gpu_cq() = default;
-	~gdaki_gpu_cq();
-	gdaki_gpu_cq(const gdaki_gpu_cq &) = delete;
-	gdaki_gpu_cq &operator=(const gdaki_gpu_cq &) = delete;
-	gdaki_gpu_cq(gdaki_gpu_cq &&) = delete;
-	gdaki_gpu_cq &operator=(gdaki_gpu_cq &&) = delete;
-
-	void build(const struct fi_efa_cq_attr &cq_attr);
-
-	efa_cuda_cq *dev() const
+	gdaki_host_cq() = default;
+	gdaki_host_cq(const gdaki_host_cq &) = delete;
+	gdaki_host_cq &operator=(const gdaki_host_cq &) = delete;
+	~gdaki_host_cq()
 	{
-		return cq;
+		if (cq_ != nullptr) {
+			fi_close(&cq_->fid);
+		}
 	}
 
+	/** Open this context's shared CQ on the domain. */
+	void open(struct fid_domain *domain, size_t cq_size);
+
+	/**
+	 * Query the CQ geometry through gda_ops. Must be called after open().
+	 */
+	void build(struct fi_efa_ops_gda *gda_ops, int ctx_id);
+
+	/** The libfabric CQ the endpoints bind (borrowed by them). */
+	struct fid_cq *cq() const { return cq_; }
+
+	/** CQ depth (num_entries): the per-context CQ-overflow gate the device reads. */
+	uint32_t depth() const { return num_entries; }
+
 private:
-	efa_cuda_cq *cq = nullptr;
+	friend class gdaki_completion_state;
+
+	/* CQ ring (host memory), owned by this object's libfabric CQ. */
+	const uint8_t *cq_buf = nullptr;
+	uint32_t entry_size = 0;
+	uint32_t num_entries = 0;
+	uint32_t cq_mask = 0;            /* num_entries - 1 (power of two) */
+	uint32_t cq_size_shift = 0;      /* log2(num_entries) */
+
+	/* CQ consumer state private to the progress pass. */
+	uint64_t cc = 0;
+	int phase = 1;
+
+	struct fid_cq *cq_ = nullptr;
 };
 
 /**
@@ -432,12 +459,12 @@ private:
  * Used directly for the data (main) endpoint, and composed inside
  * gdaki_sc_endpoint for the signal/counter endpoints.
  *
- * Owns: fid_ep + fid_cq + fid_av (via gdaki_fi_endpoint), GPU-mapped
- * SQ buffer + doorbell BAR regions, GPU-resident QP and CQ descriptors,
+ * Owns: fid_ep + fid_av (via gdaki_fi_endpoint; the CQ is borrowed),
+ * GPU-mapped SQ buffer + doorbell BAR regions, a GPU-resident QP descriptor,
  * and the [total_slots*nranks] target ahn/qpn/qkey table in GPU
  * memory.
  *
- * Destruction order (reverse declaration): targets, gpu_cq, gpu_qp,
+ * Destruction order (reverse declaration): targets, gpu_qp,
  * sq_doorbell, sq_buffer, endpoint. The libfabric EP closes last so any
  * GPU mappings of its BAR regions are torn down before the EP itself.
  * When this class is composed inside gdaki_sc_endpoint AFTER the
@@ -450,9 +477,13 @@ public:
 	gdaki_mmio_region       sq_buffer;
 	gdaki_mmio_region       sq_doorbell;
 	gdaki_gpu_qp            gpu_qp;
-	gdaki_gpu_cq            gpu_cq;
 	gdaki_target_addressing targets;   /* [total_slots*nranks] target table */
 	uint32_t                sq_size = 0;       /* SQ ring depth, populated by populate() */
+
+	/* GPU pointer to this endpoint's completed count: its FI_WRITE NIC counter
+	 * (set in the data/sc populate). The device reads it for SQ ring reuse and the
+	 * blocking Flush. populate_dev_handle copies it into the dev handle. */
+	volatile uint64_t *completed_count_dev = nullptr;
 
 	gdaki_endpoint() = default;
 	/* Implicit dtor: members destroy in reverse declaration order. */
@@ -460,15 +491,15 @@ public:
 	gdaki_endpoint &operator=(const gdaki_endpoint &) = delete;
 
 	/**
-	 * Open EP + CQ + AV on the proxy domain and enable.
+	 * Open EP + AV on the domain, bind `cq`, and enable.
 	 */
-	void open(struct fid_domain *domain, struct fi_info *ref_info, size_t cq_size);
+	void open(struct fid_domain *domain, struct fi_info *ref_info,
+		  struct fid_cq *cq);
 
 	/**
-	 * Query EFA QP/CQ attributes, map the SQ MMIO regions for GPU
-	 * access, build the GPU-resident QP/CQ descriptors, and build the
-	 * [total_slots*nranks] target table from the batched
-	 * allgather buffer. Must be called after open().
+	 * Query EFA QP attributes, map the SQ MMIO regions for GPU access, build the
+	 * GPU-resident QP descriptor, and build the [total_slots*nranks] target table
+	 * from the batched allgather buffer. Must be called after open().
 	 */
 	void populate(struct fi_efa_ops_gda *gda_ops,
 		      const std::vector<uint8_t> &all_addrs,
@@ -504,17 +535,16 @@ public:
 	gdaki_endpoint   base;          /* AFTER counter → EP closes first */
 
 	/**
-	 * Open the inner endpoint, create the FI_WRITE counter, and bind
-	 * the counter before enabling.
+	 * Open the inner endpoint, bind the shared CQ, create the FI_WRITE counter,
+	 * and bind the counter before enabling.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops);
+		  struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq);
 
 	/**
-	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
-	 * SQ MMIO BAR mapping, GPU-resident QP/CQ) and build the
-	 * [total_slots*nranks] target table from the batched allgather
-	 * buffer. Must be called after open().
+	 * Populate the inner endpoint's GPU descriptors (QP attrs, SQ MMIO BAR
+	 * mapping, GPU-resident QP) and build the [total_slots*nranks] target table
+	 * from the batched allgather buffer. Must be called after open().
 	 */
 	void populate(struct fi_efa_ops_gda *gda_ops,
 		      const std::vector<uint8_t> &all_addrs,
@@ -562,7 +592,7 @@ public:
 	 * Returned to the kernel through counter_handles[]. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle> counter_dev_handle;
 	/* signal_dev_handle exposes the REMOTE_WRITE (signal) counter via cntr_value.
-	 * Returned to the kernel through signal_handles[]. Same QP/CQ/addressing as
+	 * Returned to the kernel through signal_handles[]. Same QP and addressing as
 	 * counter_dev_handle; only cntr_value differs. */
 	gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle> signal_dev_handle;
 
@@ -572,7 +602,7 @@ public:
 	 * counters, then enables.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops);
+		  struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors, build the
@@ -628,6 +658,143 @@ struct gdaki_rail_shared {
 };
 
 /**
+ * Tracks completion for GDAKI context: it maintains the per-context and per-peer
+ * completion counts the device reads in put, flush, and wait.
+ *
+ * This object owns the context's completion queues, one gdaki_host_cq per logical
+ * context, and it drives them. progress() walks every CQ, reads the local TX
+ * completions the NIC posted, and advances each peer's ordered completion count.
+ * query_error reports the first NIC-reported completion failure it observed.
+ *
+ * Completions arrive out of order within a peer, so to turn them into an ordered
+ * count this object keeps host-side working state for every (context, peer): a
+ * sliding-window bitmask recording which sequence numbers have completed, the
+ * running length of the contiguous completed prefix, and the per-context error
+ * detail that query_error reports.
+ *
+ * progress() publishes those derived counts into a single GPU allocation that
+ * holds the per-context and per-peer completion counts the device reads, together
+ * with a contiguous host mirror of the same layout. It increments the counts in
+ * the mirror in place and copies the whole table to the device in one gdrcopy;
+ * the two regions are laid out contiguously so that one copy suffices.
+ *
+ *   word index:  0 ................. nContexts ........ +nContexts*nranks
+ *              +----------------------+-------------------------------+
+ *              | per-ctx completed[]  | per-peer peer_completion[]    |
+ *              | (1 word/ctx)         | ({ordered, error_at}, 8B ea)  |
+ *              +----------------------+-------------------------------+
+ *                ctx_word_base          peer_word_base
+ *
+ * The device keeps (submitted - completed) per context under cq_depth so the CQ
+ * does not overflow, and reads each peer's maximum ordered completion count in
+ * flushAsync and wait.
+ */
+class gdaki_completion_state {
+public:
+	gdaki_completion_state() = default;
+	gdaki_completion_state(const gdaki_completion_state &) = delete;
+	gdaki_completion_state &operator=(const gdaki_completion_state &) = delete;
+	~gdaki_completion_state();
+
+	/**
+	 * Allocate and gdrcopy-register the table, initialise the host mirror to 0,
+	 * and publish that zeroed state once. Called once, with the exact totals,
+	 * because the table is a single allocation whose device pointers are baked
+	 * into committed dev handles and so cannot grow.
+	 *
+	 * @param nContexts   number of logical contexts (one shared CQ each)
+	 * @param nranks      ranks in the context
+	 */
+	void allocate(int nContexts, int nranks);
+
+	/** Create, open, and build this context's CQ on `domain`; returns the fid_cq the
+	 * endpoints bind (borrowed). Call after open(). */
+	struct fid_cq *open_cq(int ctx_id, struct fid_domain *domain, size_t cq_size,
+			       struct fi_efa_ops_gda *gda_ops);
+
+	/** CQ depth (num_entries), uniform across the context's CQs: the device's
+	 * CQ-overflow gate. */
+	uint32_t cq_depth() const { return host_cq_[0]->depth(); }
+
+	/** Drain every owned CQ (up to max_iter each) into this state and publish once.
+	 * Returns the publish status (0 when nothing moved). */
+	int progress(size_t max_iter);
+
+	/** Format the first NIC-reported completion failure for queryLastError; returns
+	 * false when none has been seen. host_cq supplies the failing context's label. */
+	bool query_error(std::string &msg) const;
+
+	/** Device pointer to a logical context's host-published completed count. */
+	volatile uint64_t *completed_count_ctx_dev(int ctx_id) const
+	{
+		return reinterpret_cast<volatile uint64_t *>(
+			completions_table_dev + ctx_word_base + (size_t)ctx_id);
+	}
+
+	/** Device pointer to a logical context's peer_completion[nranks] array. */
+	volatile struct nccl_ofi_gin_gdaki_peer_completion *dev_peer_completion(int ctx_id) const
+	{
+		return reinterpret_cast<volatile struct nccl_ofi_gin_gdaki_peer_completion *>(
+			completions_table_dev + peer_word_base + (size_t)ctx_id * (size_t)nranks);
+	}
+
+private:
+	/* Advance one context's CQ into this state; progress() calls it per CQ. */
+	uint32_t progress_cq(gdaki_host_cq &cq, int ctx_id, size_t max_iter);
+
+	/** Publish the whole host mirror to the device in one gdrcopy. Returns the
+	 * copy_to_device status so the caller reports a host-side fault. */
+	int publish();
+
+	/** Host mirror data pointer that the progress pass increments in place. */
+	uint64_t *host() { return completions_table_host.data(); }
+
+	/** Host mirror word index of a logical context's completed count. */
+	size_t ctx_word(int ctx_id) const { return ctx_word_base + (size_t)ctx_id; }
+
+	/** Host mirror word index of a logical context's first peer_completion. */
+	size_t peer_word_base_for(int ctx_id) const
+	{
+		return peer_word_base + (size_t)ctx_id * (size_t)nranks;
+	}
+
+	size_t peer_slot(int ctx_id, int peer) const { return (size_t)ctx_id * (size_t)nranks + (size_t)peer; }
+
+	std::vector<std::unique_ptr<gdaki_host_cq>> host_cq_;   /* [nContexts], the per-context CQs this state drains */
+
+	uint64_t *completions_table_dev = nullptr;
+	nccl_ofi_device_copy::RegHandle *completions_table_reg = nullptr;
+	size_t completions_table_words = 0;
+	std::vector<uint64_t> completions_table_host;
+	size_t ctx_word_base = 0;        /* first per-ctx word (= 0) */
+	size_t peer_word_base = 0;       /* first per-peer word (= nContexts) */
+	int nContexts = 0;
+	int nranks = 0;
+
+	/* Host-side working state, context-wide, indexed [ctx_id*nranks + peer]. The
+	 * progress pass sets each completion's bit and advances the ordered prefix;
+	 * only the derived counts land in the published mirror above. */
+	std::vector<std::array<uint64_t, NCCL_OFI_GDAKI_PEER_BITS_WORDS>> peer_bits;   /* [nContexts*nranks] */
+	std::vector<uint32_t> ordered_completed_count_per_peer;                        /* [nContexts*nranks] */
+	std::vector<uint32_t> peer_error_at;                                           /* [nContexts*nranks], 0=none */
+
+	/* The progress pass records the first errored host here, biased +1 (0 means
+	 * none), so queryLastError names the failing context. */
+	std::atomic<int> error_ctx_plus_one{0};
+
+	/* Per-context error detail read by queryLastError; error_ctx_plus_one names
+	 * the first failing context. */
+	std::vector<uint8_t> has_error;    /* [nContexts] */
+	std::vector<uint8_t> err_status;   /* [nContexts] */
+	std::vector<uint16_t> err_qp_num;  /* [nContexts] */
+	std::vector<uint32_t> err_peer;    /* [nContexts] */
+	std::vector<uint32_t> err_pseq;    /* [nContexts] */
+};
+
+/** Human-readable name for an efa_io_comp_status value. */
+const char *nccl_ofi_gin_gdaki_comp_status_str(uint8_t status);
+
+/**
  * The composed GDAKI context.
  *
  * All members are lifecycle-managed objects; the destructor is
@@ -666,12 +833,19 @@ struct nccl_ofi_gin_gdaki_context {
 	uint16_t num_rails = 0;
 	uint16_t effective_rails = 0;
 
-	/* Per-ctx data (main) endpoint: libfabric EP on the reused proxy
-	 * domain plus its GPU-side SQ buffer/doorbell mappings, GPU-
-	 * resident QP/CQ descriptors, target addressing, and a
-	 * FI_WRITE hardware counter for completion tracking. One per
-	 * logical context. unique_ptr because gdaki_data_endpoint owns
-	 * non-movable members (libfabric/CUDA handles). */
+	/* Context-wide completion state: the GPU-published per-context and per-peer
+	 * completion counts the device reads, the host mirror the progress pass
+	 * publishes in one gdrcopy, the host-side working state that derives the ordered
+	 * per-peer counts, AND the per-context completion queues it drains. Declared
+	 * before the endpoint vectors below so it is destroyed after them, because a CQ
+	 * cannot close while endpoints are still bound to it. */
+	gdaki_completion_state completion_state;
+
+	/* Per-ctx data (main) endpoint: libfabric EP plus its GPU-side SQ
+	 * buffer/doorbell mappings, GPU-resident QP descriptor, target addressing, and
+	 * a FI_WRITE NIC counter that is this QP's completion source. One per logical
+	 * context. unique_ptr because gdaki_data_endpoint owns non-movable members
+	 * (libfabric/CUDA handles). */
 	std::vector<std::unique_ptr<gdaki_data_endpoint>> data;                            /* [nContexts]      */
 
 	/* Per-ctx DEDICATED PutValue poster endpoint. PutValue posts only from
@@ -691,6 +865,18 @@ struct nccl_ofi_gin_gdaki_context {
 	 * non-movable. */
 	std::vector<std::unique_ptr<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>> d_counter_handles; /* [nContexts] */
 	std::vector<std::unique_ptr<gdaki_gpu_buf<nccl_ofi_gin_gdaki_dev_counter_handle *>>> d_signal_handles;  /* [nContexts] */
+
+	/* Per-ctx submitted count, one device-owned uint64 each: the post path
+	 * bumps it once per WQE, and put's per-context CQ-overflow gate compares
+	 * (submitted - completed) against cq_depth. The host allocates and zeroes it. */
+	std::vector<std::unique_ptr<gdaki_gpu_buf<uint64_t>>> submitted_per_ctx;   /* [nContexts] */
+
+	/* Per-ctx, per-peer submitted counts: submitted_count_per_peer[p] counts
+	 * writes to peer p across every QP of a logical context. Device-owned; the
+	 * post path's atomicAdd returns the write's position in that peer's sequence,
+	 * which lets a FlushAsync request carry a single number. The host allocates and
+	 * zeroes it. */
+	std::vector<std::unique_ptr<gdaki_gpu_buf<uint32_t>>> submitted_per_peer;   /* [nContexts][nranks] */
 
 	/* Shared signal-only scratch buffer.
 	 *
