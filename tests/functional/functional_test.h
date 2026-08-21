@@ -84,9 +84,13 @@
 // Can be changed when porting new versions to the plugin
 #define NCCL_PLUGIN_SYMBOL ncclNetPlugin_v11
 #define NCCL_GIN_PLUGIN_SYMBOL ncclGinPlugin_v13
+/* GDAKI's GIN backend is exported as the v14 op-table; the GDAKI device tests
+ * use it to reach createContext_v14 (v13 is the host-proxy backend). */
+#define NCCL_GIN_PLUGIN_SYMBOL_GDAKI ncclGinPlugin_v14
 
 typedef ncclNet_v11_t test_nccl_net_t;
 typedef ncclGin_v13_t test_nccl_gin_t;
+typedef ncclGin_v14_t test_nccl_gin_gdaki_t;
 typedef ncclNetProperties_v11_t test_nccl_properties_t;
 typedef ncclNetDeviceHandle_v11_t test_nccl_net_device_handle_t;
 typedef ncclNetCommConfig_v11_t test_nccl_net_config_t;
@@ -223,6 +227,7 @@ void *load_netPlugin(void);
 test_nccl_net_t *get_netPlugin_symbol(void *netPluginLib);
 
 test_nccl_gin_t *get_ginPlugin_symbol(void *netPluginLib);
+test_nccl_gin_gdaki_t *get_ginPlugin_gdaki_symbol(void *netPluginLib);
 
 test_nccl_net_t *get_extNet(void);
 

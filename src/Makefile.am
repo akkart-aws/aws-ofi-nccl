@@ -109,8 +109,13 @@ libefa_cuda_dp_la_CPPFLAGS = \
 libefa_cuda_dp_la_CXXFLAGS = \
 	-Wno-error=sign-compare
 
+# CUDA/device is added for efa_io_defs.h alone: the CQE layout (efa_io_cdesc_common,
+# enum efa_io_comp_status) that the host-side CQ poller parses. That header is
+# plain C with no CUDA tokens, unlike the .cuh files in the same directory, which
+# are device-only and must not be included from host sources.
 AM_CPPFLAGS += \
 	-isystem $(abs_top_srcdir)/3rd-party/efa-dp-direct/CUDA/common \
+	-isystem $(abs_top_srcdir)/3rd-party/efa-dp-direct/CUDA/device \
 	-isystem $(abs_top_srcdir)/3rd-party/efa-dp-direct/CUDA/host
 
 # Make the private host implementation available to the internal plugin for

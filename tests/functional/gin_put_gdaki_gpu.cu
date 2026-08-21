@@ -30,17 +30,11 @@ struct proc_handle {
 };
 
 /*
- * GPU kernel: build, post, and poll a single RDMA_WRITE WQE through the
- * GDAKI QP/CQ that the plugin already populated in GPU memory.
+ * GPU kernel: build and post a single RDMA_WRITE WQE through the GDAKI QP the
+ * plugin populated in GPU memory. The device does not poll the CQ; the host CQ
+ * progress pass drains the completion.
  *
  * Single-thread (gridDim=1, blockDim=1). All other lanes early-return.
- * Output values:
- *   *out_status:  efa_io_comp_status_* (EFA_IO_COMP_STATUS_OK on success)
- *   *out_q_type:  efa_io_queue_type, expected EFA_IO_SEND_QUEUE on a
- *                 completed TX
- *   *out_op_type: efa_cuda_wc_opcode, expected EFA_CUDA_WC_RDMA_WRITE
- *   *out_req_id:  matches the wr_id we set (0)
- *   *out_done:    1 on completion, 0 on timeout
  */
 __global__ void gin_put_gpu_kernel(nccl_ofi_gin_gdaki_dev_handle *dev,
 				   int peer,
@@ -48,18 +42,11 @@ __global__ void gin_put_gpu_kernel(nccl_ofi_gin_gdaki_dev_handle *dev,
 				   uint32_t dst_rkey,
 				   uint64_t src_addr,
 				   uint32_t src_lkey,
-				   uint32_t bytes,
-				   int max_iters,
-				   uint8_t *out_status,
-				   uint8_t *out_q_type,
-				   uint8_t *out_op_type,
-				   uint16_t *out_req_id,
-				   uint32_t *out_done)
+				   uint32_t bytes)
 {
 	if (threadIdx.x != 0 || blockIdx.x != 0) return;
 
 	auto *qp = dev->data.qp;
-	auto *cq = dev->data.cq;
 
 	efa_io_tx_wqe wr;
 	efa_cuda_init_rdma_write_wr(&wr, /*wr_id=*/0, dst_rkey, dst_addr);
@@ -73,22 +60,6 @@ __global__ void gin_put_gpu_kernel(nccl_ofi_gin_gdaki_dev_handle *dev,
 	efa_cuda_start_sq_batch(qp, 1);
 	efa_cuda_sq_batch_place_wr(qp, 0, &wr);
 	efa_cuda_flush_sq_wrs(qp);
-
-	*out_done = 0;
-	for (int i = 0; i < max_iters; i++) {
-		void *wc = efa_cuda_cq_poll(cq, /*position=*/0);
-		if (wc != nullptr) {
-			auto *cqe = reinterpret_cast<efa_io_cdesc_common *>(wc);
-			*out_status = cqe->status;
-			/* q_type lives in bits [2:1] of cqe->flags. */
-			*out_q_type = (uint8_t)((cqe->flags >> 1) & 0x3);
-			*out_op_type = efa_cuda_wc_read_opcode(wc);
-			*out_req_id = efa_cuda_wc_read_req_id(wc);
-			efa_cuda_cq_pop(cq, 1);
-			*out_done = 1;
-			return;
-		}
-	}
 }
 
 int main(int argc, char *argv[])
@@ -120,7 +91,7 @@ int main(int argc, char *argv[])
 	set_system_page_size();
 	auto *net_plugin_handle = load_netPlugin();
 	auto *extNet = get_netPlugin_symbol(net_plugin_handle);
-	auto *extGin = get_ginPlugin_symbol(net_plugin_handle);
+	auto *extGin = get_ginPlugin_gdaki_symbol(net_plugin_handle);
 	if (!extNet || !extGin) { MPI_Finalize(); return ncclInternalError; }
 
 	void *netCtx = nullptr;
@@ -147,10 +118,9 @@ int main(int argc, char *argv[])
 	OFINCCLCHECK(extGin->connect(ginCtx, handles_ptrs.data(), nranks, rank,
 				     listenComm, &collComm));
 
-	ncclGinConfig_v13_t ginConfig = {};
+	ncclGinConfig_v14_t ginConfig = {};
 	ginConfig.nContexts = 1;
 	ginConfig.queueDepth = 64;
-	ginConfig.trafficClass = -1;
 
 	void *proxyCtx = nullptr;
 	ncclNetDeviceHandle_v11_t *devHandle = nullptr;
@@ -233,42 +203,35 @@ int main(int argc, char *argv[])
 			      "R0: GPU writing to R%d lkey=0x%x rkey=0x%x addr=0x%lx",
 			      tgt, src_lkey, all_rkeys[tgt], all_dst_addrs[tgt]);
 
-		struct kernel_result {
-			uint8_t  status;
-			uint8_t  q_type;
-			uint8_t  op_type;
-			uint8_t  pad0;
-			uint16_t req_id;
-			uint16_t pad1;
-			uint32_t done;
-		};
-		kernel_result *d_result = nullptr;
-		CUDACHECK(cudaMalloc(&d_result, sizeof(kernel_result)));
-		CUDACHECK(cudaMemset(d_result, 0, sizeof(kernel_result)));
-
 		auto *dev_h = reinterpret_cast<nccl_ofi_gin_gdaki_dev_handle *>(devHandle->handle);
 
 		gin_put_gpu_kernel<<<1, 1>>>(
 			dev_h, tgt,
 			all_dst_addrs[tgt], all_rkeys[tgt],
 			(uint64_t)src_gpu, src_lkey,
-			(uint32_t)BUF_SIZE,
-			/*max_iters=*/100000000,
-			&d_result->status, &d_result->q_type, &d_result->op_type,
-			&d_result->req_id, &d_result->done);
+			(uint32_t)BUF_SIZE);
 		CUDACHECK(cudaDeviceSynchronize());
 
-		kernel_result h_result = {};
-		CUDACHECK(cudaMemcpy(&h_result, d_result, sizeof(h_result), cudaMemcpyDeviceToHost));
-		CUDACHECK(cudaFree(d_result));
+		/* The device posted the write. The host CQ progress pass drains the
+		 * completion and publishes completed_count_per_ctx. Drive it until that
+		 * count advances. Read the count's device pointer out of the dev handle,
+		 * then poll it. */
+		nccl_ofi_gin_gdaki_dev_handle h_dev = {};
+		CUDACHECK(cudaMemcpy(&h_dev, dev_h, sizeof(h_dev), cudaMemcpyDeviceToHost));
+		const void *ctx_completed_dev = (const void *)h_dev.completed_count_per_ctx;
 
-		if (!h_result.done) {
-			NCCL_OFI_WARN("R0: CQ poll timeout");
+		bool done = false;
+		for (int i = 0; i < 1000000 && !done; i++) {
+			OFINCCLCHECK(extGin->ginProgress(proxyCtx));
+			uint64_t ctx_completed = 0;
+			CUDACHECK(cudaMemcpy(&ctx_completed, ctx_completed_dev,
+					     sizeof(ctx_completed), cudaMemcpyDeviceToHost));
+			if (ctx_completed >= 1) done = true;
+		}
+		if (!done) {
+			NCCL_OFI_WARN("R0: host progress pass did not drain the completion");
 		} else {
-			NCCL_OFI_INFO(NCCL_NET,
-				      "R0: CQ completion status=%u op_type=%u q_type=%u req_id=%u",
-				      h_result.status, h_result.op_type, h_result.q_type,
-				      h_result.req_id);
+			NCCL_OFI_INFO(NCCL_NET, "R0: completion drained by host progress pass");
 		}
 	}
 
