@@ -387,13 +387,13 @@ void gdaki_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 void gdaki_data_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
 			       struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq)
 {
-	/* Create the FI_WRITE counter first; it is bound to the inner endpoint
+	/* Create the FI_WRITE + FI_READ counter first; it is bound to the inner endpoint
 	 * between open() and enable() and is this QP's per-QP completion source
 	 * (SQ ring reuse + blocking Flush). */
-	write_cntr.create(gda_ops, domain);
+	read_write_cntr.create(gda_ops, domain);
 
 	base.endpoint.open(domain, ref_info, cq);
-	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
+	base.endpoint.bind(&read_write_cntr.get()->fid, FI_WRITE | FI_READ);
 	base.endpoint.enable();
 }
 
@@ -402,8 +402,8 @@ void gdaki_data_endpoint::populate(struct fi_efa_ops_gda *gda_ops,
 				   size_t ep_addr_len, int total_slots, int nranks)
 {
 	base.populate(gda_ops, all_addrs, ep_addr_len, total_slots, nranks);
-	/* Per-QP completion is this endpoint's FI_WRITE NIC counter. */
-	base.completed_count_dev = write_cntr.gpu_ptr();
+	/* Per-QP completion is this endpoint's FI_WRITE + FI_READ NIC counter. */
+	base.completed_count_dev = read_write_cntr.gpu_ptr();
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,

@@ -509,14 +509,14 @@ public:
 /**
  * Host-side state for the data (main) endpoint.
  *
- * Composes a gdaki_endpoint plus a FI_WRITE hardware counter for
- * tracking local completion of outgoing data-only writes. The kernel
+ * Composes a gdaki_endpoint plus a FI_WRITE + FI_READ hardware counter for
+ * tracking local completion of outgoing data operations. The kernel
  * spins on this counter (instead of polling the CQ) to determine when
- * Put has completed locally; same model as gdaki_sc_endpoint, just
+ * Put or Get has completed locally; same model as gdaki_sc_endpoint, just
  * without the FI_REMOTE_WRITE counter (the data EP isn't a signal
  * target).
  *
- * Member declaration order is critical: write_cntr MUST be declared
+ * Member declaration order is critical: read_write_cntr MUST be declared
  * BEFORE base so the inner libfabric endpoint closes before the
  * counter bound to it (closing a counter while it is still bound to
  * an open endpoint returns EBUSY in libfabric).
@@ -531,11 +531,11 @@ public:
 	gdaki_data_endpoint(const gdaki_data_endpoint &) = delete;
 	gdaki_data_endpoint &operator=(const gdaki_data_endpoint &) = delete;
 
-	gdaki_hw_counter write_cntr;        /* FI_WRITE (local completion) */
+	gdaki_hw_counter read_write_cntr;   /* FI_WRITE | FI_READ (local completion) */
 	gdaki_endpoint   base;          /* AFTER counter → EP closes first */
 
 	/**
-	 * Open the inner endpoint, bind the shared CQ, create the FI_WRITE counter,
+	 * Open the inner endpoint, bind the shared CQ, create the FI_WRITE + FI_READ counter,
 	 * and bind the counter before enabling.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
