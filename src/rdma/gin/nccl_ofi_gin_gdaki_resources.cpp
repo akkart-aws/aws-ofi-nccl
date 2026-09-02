@@ -19,6 +19,18 @@
 
 static constexpr uint32_t gdaki_narrow_wqe_size = 64;
 static constexpr uint32_t gdaki_narrow_wqe_inline_size = 32;
+
+/*
+ * Inline-data capacity requested for a wide endpoint.
+ *
+ * A 64B EFA WQE holds at most 32B of inline data and has no inline region in
+ * its RDMA-write descriptor at all. Requesting more than 32B is what makes
+ * libfabric create the QP with EFADV_QP_FLAGS_INLINE_WRITE, which rdma-core
+ * turns into a 128B WQE.
+ */
+static constexpr size_t gdaki_wide_wqe_inject_size = 33;
+static constexpr uint32_t gdaki_wide_wqe_size = 128;
+static constexpr uint32_t gdaki_wide_wqe_inline_size = 80;
 static constexpr uint32_t gdaki_max_rdma_sges = 1;
 
 using gdaki_efa_dp_context =
@@ -68,7 +80,8 @@ static gdaki_efa_dp_context gdaki_create_efa_dp_context(int backend_version)
  * so FI_SOURCE is not requested. FI_HMEM is still needed because the endpoint
  * is used to access GPU memory. efa-direct requires FI_CONTEXT2 per fi_efa(7).
  */
-static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
+static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info,
+			    bool wide_wqe)
 {
 	hints.caps = FI_MSG | FI_RMA | FI_HMEM;
 	hints.mode = FI_CONTEXT2;
@@ -83,6 +96,14 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
 	hints.domain_attr->control_progress = FI_PROGRESS_AUTO;
 	hints.domain_attr->data_progress = FI_PROGRESS_AUTO;
 
+	/* Ask for a 128B WQE only for an endpoint that stages inline data
+	 * (PutValue). The SQ lives in the NIC's fixed-size low-latency queue,
+	 * so a 128B entry halves the queue depth; Put and Get carry their
+	 * payload through the SGE and keep the 64B entry and full depth. */
+	if (wide_wqe) {
+		hints.tx_attr->inject_size = gdaki_wide_wqe_inject_size;
+	}
+
 	/* Narrow fi_getinfo to the provider / fabric / domain the proxy
 	 * already opened. Names are required to obtain exactly one result. */
 	hints.fabric_attr->prov_name = strdup(ref_info->fabric_attr->prov_name);
@@ -94,13 +115,13 @@ static void get_gdaki_hints(struct fi_info &hints, struct fi_info *ref_info)
  * Obtain a GDAKI-owned fi_info via fi_getinfo, narrowed to exactly the
  * fabric / domain the proxy reference points at.
  */
-static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
+static struct fi_info *get_gdaki_info(struct fi_info *ref_info, bool wide_wqe)
 {
 	struct fi_info *hints = fi_allocinfo();
 	if (hints == nullptr) {
 		throw std::runtime_error("fi_allocinfo for GDAKI hints failed");
 	}
-	get_gdaki_hints(*hints, ref_info);
+	get_gdaki_hints(*hints, ref_info, wide_wqe);
 
 	struct fi_info *results = nullptr;
 	int ret = fi_getinfo(FI_VERSION(1, 18), nullptr, nullptr, 0ULL,
@@ -124,13 +145,13 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info)
 }
 
 void gdaki_fi_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     size_t cq_size)
+			     size_t cq_size, bool wide_wqe)
 {
 	if (ep || cq || av || info) {
 		throw std::runtime_error("gdaki_fi_endpoint: double open");
 	}
 
-	info = get_gdaki_info(ref_info);
+	info = get_gdaki_info(ref_info, wide_wqe);
 
 	struct fi_cq_attr cq_attr = {};
 	cq_attr.format = FI_CQ_FORMAT_DATA;
@@ -219,7 +240,11 @@ void gdaki_gpu_qp::build(int backend_version_in,
 	case 1:
 		break;
 	case 2:
-		attrs.sq_max_inline_data = gdaki_narrow_wqe_inline_size;
+		/* Inline capacity follows the queried entry size: the 128B WQE
+		 * carries 80 inline bytes, the 64B WQE carries 32. */
+		attrs.sq_max_inline_data = (sq_attr.entry_size == gdaki_wide_wqe_size)
+						   ? gdaki_wide_wqe_inline_size
+						   : gdaki_narrow_wqe_inline_size;
 		attrs.sq_max_rdma_sges = gdaki_max_rdma_sges;
 		/*
 		 * efa-dp-direct v1 writes 64-bit request IDs. NCCL uses the
@@ -374,9 +399,9 @@ void gdaki_target_addressing::populate(gdaki_fi_endpoint &endpoint,
 }
 
 void gdaki_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			  size_t cq_size)
+			  size_t cq_size, bool wide_wqe)
 {
-	endpoint.open(domain, ref_info, cq_size);
+	endpoint.open(domain, ref_info, cq_size, wide_wqe);
 	endpoint.enable();
 }
 
@@ -392,11 +417,12 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 					 std::string(fi_strerror(-ret)));
 
 	if (backend_version == 2 &&
-	    sq_attr.entry_size != gdaki_narrow_wqe_size) {
+	    sq_attr.entry_size != gdaki_narrow_wqe_size &&
+	    sq_attr.entry_size != gdaki_wide_wqe_size) {
 		throw std::runtime_error(
-			"gdaki_endpoint: backendVersion 2 requires a 64-byte narrow SQ WQE "
-			"but this endpoint has " + std::to_string(sq_attr.entry_size) +
-			" bytes");
+			"gdaki_endpoint: backendVersion 2 requires a 64- or 128-byte "
+			"SQ WQE but this endpoint has " +
+			std::to_string(sq_attr.entry_size) + " bytes");
 	}
 
 	sq_buffer.map(sq_attr.buffer,
@@ -429,14 +455,15 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 }
 
 void gdaki_data_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			       struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags)
+			       struct fi_efa_ops_gda *gda_ops, uint64_t cntr_flags,
+			       bool wide_wqe)
 {
 	/* Create the counter first; it will be bound to the inner endpoint
 	 * between open() and enable(). */
 	local_cntr.create(gda_ops, domain);
 
 	/* Open the inner endpoint without enable. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), wide_wqe);
 
 	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
 
@@ -462,7 +489,7 @@ void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info
 
 	/* Open the inner endpoint without enable. Use the same CQ sizing as
 	 * the data endpoint so callers get consistent capacity per env config. */
-	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size());
+	base.endpoint.open(domain, ref_info, ofi_nccl_cq_size(), /* wide_wqe */ false);
 
 	/* Bind counters before enabling. */
 	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);

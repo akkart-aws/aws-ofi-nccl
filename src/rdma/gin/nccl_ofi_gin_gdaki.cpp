@@ -758,7 +758,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * rail_id = ctx_id % num_rails).
 			 */
 			/* The data endpoint issues both Put and Get, so it counts reads too. */
-			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE | FI_READ);
+			/* Put and Get carry their payload through the SGE, so the data
+			 * endpoint keeps the 64B entry and the full SQ depth. */
+			ctx->data[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+						FI_WRITE | FI_READ, /* wide_wqe */ false);
 			if (local_n_sc > 0) {
 				ctx->sc_endpoints[ctx_id].reserve(local_n_sc);
 			}
@@ -768,7 +771,10 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			}
 			/* Dedicated PutValue poster endpoint. */
 			/* PutValue only writes. */
-			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops, FI_WRITE);
+			/* PutValue stages its value as WQE inline data, so this is the
+			 * one endpoint that takes the 128B entry (at half SQ depth). */
+			ctx->pvdata[ctx_id]->open(ofi_domain, proxy_info, gda_ops,
+						  FI_WRITE, /* wide_wqe */ true);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
