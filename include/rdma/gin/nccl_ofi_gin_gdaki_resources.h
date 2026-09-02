@@ -195,10 +195,11 @@ public:
 	 * Does NOT enable — caller must call enable() after any
 	 * additional binds (e.g. counters).
 	 *
-	 * Version 2 asks for the 128B WQE.
+	 * Version 2 asks for the 128B WQE when wide_wqe is set; a narrow
+	 * endpoint keeps the 64B entry and the full SQ depth.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  size_t cq_size, int backend_version);
+		  size_t cq_size, int backend_version, bool wide_wqe);
 
 	/*
 	 * Enable the endpoint. Must be called after open() and
@@ -506,7 +507,7 @@ public:
 	 * Open EP + CQ + AV on the proxy domain and enable.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info, size_t cq_size,
-		  int backend_version);
+		  int backend_version, bool wide_wqe);
 
 	/**
 	 * Query EFA QP/CQ attributes, map the SQ MMIO regions for GPU
@@ -555,7 +556,7 @@ public:
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
 		  struct fi_efa_ops_gda *gda_ops, int backend_version,
-		  uint64_t cntr_flags);
+		  uint64_t cntr_flags, bool wide_wqe);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors (QP/CQ attrs,
