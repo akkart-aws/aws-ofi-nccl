@@ -544,10 +544,10 @@ static void populate_dev_handle(nccl_ofi_gin_gdaki_dev_handle_v2 &h,
 
 	h.reserved0 = 0;
 	h.reserved1 = 0;
-	h.submitted_count_per_peer = ctx->submitted_per_peer[ctx_id]->dev;
+	h.submitted_count_per_peer = ctx->submitted_per_peer->dev + (size_t)ctx_id * (size_t)nranks;
 	h.ordered_completed_count_per_peer =
 		ctx->completion_state.dev_ordered_completed_count_per_peer(ctx_id);
-	h.peer_window = NCCL_OFI_GDAKI_PEER_WINDOW;
+	h.peer_window = ctx->completion_state.peer_window();
 	h.submitted_count_per_ctx = ctx->submitted_per_ctx[ctx_id]->dev;
 	h.completed_count_per_ctx = ctx->completion_state.completed_count_ctx_dev(ctx_id);
 	h.cq_depth = ctx->completion_state.cq_depth();
@@ -809,16 +809,27 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 		const size_t total_slots = 1 + (size_t)global_n_sc;
 
 		/* v2 publishes host-polled completion state and uses one shared CQ per
-		 * logical context. v1 instead creates a private CQ per endpoint. */
+		 * logical context. v1 instead creates a private CQ per endpoint.
+		 *
+		 * A v2 context whose NIC does not echo 64-bit request ids takes its
+		 * completions from the posters' NIC counters instead of the CQ, and then
+		 * also uses a private CQ per endpoint: libfabric drains an endpoint's CQ
+		 * when it closes, and on this NIC rdma-core's drain of a shared CQ
+		 * would finalize the sibling QPs' completions against request-id slots
+		 * those QPs never took. The capability is a NIC property, so one probe
+		 * on rail 0 decides it for every endpoint of the comm. */
+		bool counted = false;
 		if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_2) {
+			counted = !gdaki_domain_has_64_bit_req_id(gda_domain_rail[0], gda_info_rail[0],
+								  gda_ops_rail[0]);
+
 			ctx->completion_state.allocate(nContexts, nranks);
 
-			for (int i = 0; i < nContexts; i++) {
-				auto counts = std::make_unique<gdaki_gpu_buf<uint32_t>>();
-				counts->allocate((size_t)nranks);
-				counts->commit();
-				ctx->submitted_per_peer.push_back(std::move(counts));
+			ctx->submitted_per_peer = std::make_unique<gdaki_gpu_buf<uint32_t>>();
+			ctx->submitted_per_peer->allocate((size_t)nContexts * (size_t)nranks);
+			ctx->submitted_per_peer->commit();
 
+			for (int i = 0; i < nContexts; i++) {
 				auto ctx_count = std::make_unique<gdaki_gpu_buf<uint64_t>>();
 				ctx_count->allocate(1);
 				ctx_count->commit();
@@ -845,11 +856,17 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			 * v2 first creates this logical context's shared CQ; data, pvdata
 			 * and every sc EP bind it. v1 passes NULL below, causing each
 			 * endpoint to create the private CQ represented in its device handle.
+			 * A counted v2 context passes NULL as well: it never reads the CQ,
+			 * and a private CQ keeps libfabric's close-time drain to the one QP
+			 * being destroyed.
 			 */
 			struct fid_cq *scq = nullptr;
 			if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_2) {
-				scq = ctx->completion_state.open_cq(
+				struct fid_cq *ctx_cq = ctx->completion_state.open_cq(
 					ctx_id, ofi_domain, ofi_nccl_cq_size(), gda_ops);
+				if (!counted) {
+					scq = ctx_cq;
+				}
 			}
 
 			/* Put and Get carry their payload through the SGE, so the data
@@ -970,6 +987,43 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 							   return ctx->sc_endpoints[ctx_id][i]
 								   ->signal_dev_handle_v2.dev;
 						   });
+			}
+		}
+
+		/* Completion tracking mode, decided by the probe above. Every endpoint
+		 * must agree with it: a mixed answer would mean two NICs of one comm
+		 * differ in the capability, which the topology chosen above cannot
+		 * serve. */
+		if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_2) {
+			for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+				bool ok = ctx->data[ctx_id]->base.has_64_bit_req_id == !counted &&
+					  ctx->pvdata[ctx_id]->base.has_64_bit_req_id == !counted;
+				for (int i = 0; i < local_n_sc && ok; i++) {
+					ok = ctx->sc_endpoints[ctx_id][i]->base.has_64_bit_req_id == !counted;
+				}
+				if (!ok) {
+					throw std::runtime_error(
+						"gin GDAKI: endpoints disagree on FI_EFA_WQ_CAPS_64_BIT_REQ_ID "
+						"across rails");
+				}
+			}
+			if (counted) {
+				/* Every endpoint that posts on a context: data, pvdata, and
+				 * each sc endpoint when it serves as a counter. */
+				std::vector<std::vector<volatile uint64_t *>> poster_cntrs((size_t)nContexts);
+				for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+					auto &cntrs = poster_cntrs[(size_t)ctx_id];
+					cntrs.push_back(ctx->data[ctx_id]->local_cntr.gpu_ptr());
+					cntrs.push_back(ctx->pvdata[ctx_id]->local_cntr.gpu_ptr());
+					for (int i = 0; i < local_n_sc; i++) {
+						cntrs.push_back(ctx->sc_endpoints[ctx_id][i]->write_cntr.gpu_ptr());
+					}
+				}
+				ctx->completion_state.set_counted_mode(ctx->submitted_per_peer->dev, poster_cntrs);
+				NCCL_OFI_INFO(NCCL_NET,
+					      "gin GDAKI: NIC lacks 64-bit request ids; completions "
+					      "come from the NIC counters. FlushAsync/Wait complete "
+					      "once the context drains.");
 			}
 		}
 

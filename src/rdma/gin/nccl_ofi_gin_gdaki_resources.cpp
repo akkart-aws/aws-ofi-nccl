@@ -352,8 +352,10 @@ void gdaki_gpu_qp::build(int backend_version_in,
 		 * WQE geometry reported in sq_attr. */
 		attrs.sq_max_inline_data = sq_max_inline_data;
 		attrs.sq_max_rdma_sges = gdaki_max_rdma_sges;
-		/* gdaki_endpoint::populate verified that the provider QP supports
-		 * the 64-bit request IDs used by host completion polling. */
+		/* The major-1 QP layout posts 64-bit request IDs unconditionally and
+		 * requires this capability bit. A NIC without the capability accepts
+		 * the WQEs and echoes only the low 16 bits back; the completion state
+		 * then counts completions instead of attributing them. */
 		attrs.sq_caps = EFA_CUDA_WQ_CAPS_64_BIT_REQ_ID;
 		break;
 	default:
@@ -555,6 +557,26 @@ void gdaki_endpoint::open(struct fid_domain *domain,
 	endpoint.enable();
 }
 
+bool gdaki_domain_has_64_bit_req_id(struct fid_domain *domain, struct fi_info *ref_info,
+				    struct fi_efa_ops_gda *gda_ops)
+{
+	gdaki_fi_endpoint probe;
+	probe.open(domain, ref_info, /* shared_cq */ nullptr, /* inline_write_size */ 0);
+	probe.enable();
+
+	struct fi_efa_wq_attr sq_attr = {}, rq_attr = {};
+	int ret = gda_ops->query_qp_wqs(probe.ep, &sq_attr, &rq_attr);
+	if (ret != 0) {
+		throw std::runtime_error("gdaki capability probe: query_qp_wqs failed: " +
+					 std::string(fi_strerror(-ret)));
+	}
+#if HAVE_FI_EFA_WQ_ATTR_CAPS
+	return (sq_attr.caps & FI_EFA_WQ_CAPS_64_BIT_REQ_ID) != 0;
+#else
+	return false;
+#endif
+}
+
 void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_ops,
 			      const std::vector<uint8_t> &all_addrs,
 			      size_t ep_addr_len, int total_slots, int nranks)
@@ -576,17 +598,11 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 			"-byte SQ entries instead of 128-byte wide WQEs");
 	}
 
-	bool has_64_bit_req_id = false;
+	has_64_bit_req_id = false;
 #if HAVE_FI_EFA_WQ_ATTR_CAPS
 	has_64_bit_req_id =
 		(sq_attr.caps & FI_EFA_WQ_CAPS_64_BIT_REQ_ID) != 0;
 #endif
-	if (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_2 &&
-	    !has_64_bit_req_id) {
-		throw std::runtime_error(
-			"gdaki_endpoint: backendVersion 2 completion polling "
-			"requires FI_EFA_WQ_CAPS_64_BIT_REQ_ID");
-	}
 
 	sq_buffer.map(sq_attr.buffer,
 		      (size_t)sq_attr.num_entries * sq_attr.entry_size);
@@ -731,6 +747,18 @@ void gdaki_sc_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda
 
 gdaki_completion_state::~gdaki_completion_state()
 {
+	for (auto &ctx_cntrs : cntr_regs_) {
+		for (auto &c : ctx_cntrs) {
+			if (c.reg != nullptr) {
+				get_device_copy().deregister_region(c.reg);
+			}
+		}
+	}
+	cntr_regs_.clear();
+	if (submitted_reg_ != nullptr) {
+		get_device_copy().deregister_region(submitted_reg_);
+		submitted_reg_ = nullptr;
+	}
 	if (completions_table_reg != nullptr) {
 		get_device_copy().deregister_region(completions_table_reg);
 		completions_table_reg = nullptr;
@@ -800,14 +828,67 @@ struct fid_cq *gdaki_completion_state::open_cq(int ctx_id, struct fid_domain *do
 	return host_cq_[(size_t)ctx_id]->cq();
 }
 
+void gdaki_completion_state::set_counted_mode(uint32_t *submitted_per_peer_dev,
+					      const std::vector<std::vector<volatile uint64_t *>> &poster_cntrs)
+{
+	if (completions_table_dev == nullptr) {
+		throw std::runtime_error("gdaki_completion_state: set_counted_mode before allocate");
+	}
+	if (poster_cntrs.size() != (size_t)nContexts) {
+		throw std::runtime_error("gdaki_completion_state: set_counted_mode context count mismatch");
+	}
+
+	const size_t table_bytes = (size_t)nContexts * (size_t)nranks * sizeof(uint32_t);
+	nccl_ofi_device_copy::RegHandle *reg = nullptr;
+	if (get_device_copy().register_region(submitted_per_peer_dev, table_bytes, reg) != 0) {
+		throw std::runtime_error(
+			"gdaki_completion_state: gdrcopy register_region of submitted counts failed");
+	}
+	submitted_reg_ = reg;
+	submitted_snap_.assign((size_t)nContexts * (size_t)nranks, 0);
+	submitted_prev_.assign((size_t)nContexts * (size_t)nranks, 0);
+	completed_prev_.assign((size_t)nContexts, 0);
+	have_prev_ = false;
+	check_pending_ = false;
+
+	cntr_regs_.assign((size_t)nContexts, {});
+	for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+		for (volatile uint64_t *cntr : poster_cntrs[(size_t)ctx_id]) {
+			poster_cntr c;
+			if (get_device_copy().register_region(const_cast<uint64_t *>(cntr), sizeof(uint64_t),
+							      c.reg) != 0) {
+				throw std::runtime_error(
+					"gdaki_completion_state: gdrcopy register_region of a NIC counter failed");
+			}
+			cntr_regs_[(size_t)ctx_id].push_back(c);
+		}
+	}
+
+	/* Counted mode keeps no per-peer bitmap. */
+	peer_bits.clear();
+	peer_bits.shrink_to_fit();
+	counted_ = true;
+}
+
 int gdaki_completion_state::progress(size_t max_iter)
 {
 	bool dirty = false;
 	for (size_t i = 0; i < host_cq_.size(); ++i) {
 		if (!host_cq_[i]) continue;
-		if (progress_cq(*host_cq_[i], (int)i, max_iter) > 0) {
+		const bool moved = counted_ ? progress_counters((int)i)
+					    : progress_cq(*host_cq_[i], (int)i, max_iter) > 0;
+		if (moved) {
 			dirty = true;
 		}
+	}
+	/* A context reaches drained only through a completion, so the drained check
+	 * runs in a pass whose counters advanced, plus the following pass, which closes
+	 * the check the advancing pass opened. */
+	if (counted_ && (dirty || check_pending_)) {
+		if (publish_peers_when_drained()) {
+			dirty = true;
+		}
+		check_pending_ = dirty;
 	}
 	if (dirty) {
 		return publish();
@@ -967,6 +1048,91 @@ uint32_t gdaki_completion_state::progress_cq(gdaki_host_cq &cq, int ctx_id, size
 	}
 
 	return consumed;
+}
+
+bool gdaki_completion_state::progress_counters(int ctx_id)
+{
+	/* The context's completed count is the sum of its posters' NIC counters: every
+	 * write ticks exactly one poster's FI_WRITE/FI_READ counter. Each counter wraps
+	 * at 2^31, so this pass reads its low 31 bits, takes the masked delta from the
+	 * last reading, and accumulates it into the 64-bit count. The device keeps the
+	 * outstanding count under cq_depth, so a delta is always below the wrap. */
+	uint64_t *ctx_counts = host_ctx_counts();
+	uint64_t advanced = 0;
+	for (auto &c : cntr_regs_[(size_t)ctx_id]) {
+		uint64_t value = 0;
+		if (get_device_copy().copy_from_device(*c.reg, 0, &value, sizeof(value)) != 0) {
+			continue;
+		}
+		const uint32_t now = (uint32_t)value & 0x7fffffffu;
+		const uint32_t delta = (now - c.last) & 0x7fffffffu;
+		c.last = now;
+		advanced += delta;
+	}
+	ctx_counts[ctx_id] += advanced;
+	return advanced != 0;
+}
+
+bool gdaki_completion_state::publish_peers_when_drained()
+{
+	/* Without attribution, the only state that proves a particular write to a peer
+	 * completed is the whole context having drained: every admitted write done. At
+	 * that instant each peer's ordered count equals its submitted count.
+	 *
+	 * The check brackets a snapshot of the per-peer submitted counts between two
+	 * completed counts in time: the previous pass took completed_prev_ and then
+	 * submitted_prev_, and this pass reads submitted_snap_. The counts only grow, so
+	 * the sum of submitted_snap_ bounds what was admitted by the time the previous
+	 * snapshot was taken, and completed_prev_ bounds what had drained by then from
+	 * below. When completed_prev_ >= sum(submitted_snap_), the context was drained
+	 * at the previous snapshot, which is then a safe ordered count for every peer. */
+	const size_t table_bytes = (size_t)nContexts * (size_t)nranks * sizeof(uint32_t);
+	uint64_t *ctx_counts = host_ctx_counts();
+
+	if (get_device_copy().copy_from_device(*submitted_reg_, 0, submitted_snap_.data(), table_bytes) != 0) {
+		return false;
+	}
+
+	bool moved = false;
+	if (have_prev_) {
+		for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+			const uint32_t *snap = &submitted_snap_[(size_t)ctx_id * (size_t)nranks];
+			const uint32_t *prev = &submitted_prev_[(size_t)ctx_id * (size_t)nranks];
+
+			/* The per-peer submitted counts are 32-bit and wrap, so the admitted
+			 * total and the drained test are taken modulo 2^32. The device keeps
+			 * admitted minus completed under cq_depth, so the reduced difference
+			 * is exact. */
+			uint32_t admitted = 0;
+			for (int p = 0; p < nranks; p++) {
+				admitted += snap[p];
+			}
+			if (admitted - (uint32_t)completed_prev_[(size_t)ctx_id] != 0) {
+				continue;
+			}
+
+			uint32_t *peer_counts = host_peer_counts(ctx_id);
+			for (int p = 0; p < nranks; p++) {
+				const size_t slot = peer_slot(ctx_id, p);
+				/* Advance only; the device requires a non-decreasing ordered count. */
+				if ((int32_t)(prev[p] - ordered_completed_count_per_peer[slot]) > 0) {
+					ordered_completed_count_per_peer[slot] = prev[p];
+					peer_counts[p] = prev[p];
+					moved = true;
+				}
+			}
+		}
+	}
+
+	/* This pass's counted completions and snapshot become the next check's bracket.
+	 * The counts were taken before the snapshot above, which is the order the
+	 * check relies on. */
+	for (int ctx_id = 0; ctx_id < nContexts; ctx_id++) {
+		completed_prev_[(size_t)ctx_id] = ctx_counts[ctx_id];
+	}
+	submitted_prev_.swap(submitted_snap_);
+	have_prev_ = true;
+	return moved;
 }
 
 int gdaki_completion_state::publish()

@@ -485,6 +485,16 @@ private:
 };
 
 /**
+ * Report whether QPs on `domain` echo 64-bit request ids in their completions
+ * (FI_EFA_WQ_CAPS_64_BIT_REQ_ID). The capability is a property of the NIC, so
+ * this opens one throwaway endpoint, queries its SQ attributes, and closes it.
+ * createContext calls this before it opens any endpoint, because the answer
+ * decides whether those endpoints share one CQ per context or each own one.
+ */
+bool gdaki_domain_has_64_bit_req_id(struct fid_domain *domain, struct fi_info *ref_info,
+				    struct fi_efa_ops_gda *gda_ops);
+
+/**
  * Remediation hint for a cntr_open_ext() failure, or "" if we have none.
  *
  * Only FI_ENOSYS is mapped: the efa provider compiled the comp-cntr stub
@@ -631,6 +641,12 @@ public:
 	gdaki_target_addressing targets;   /* [total_slots*nranks] target table */
 	uint32_t                sq_size = 0;       /* SQ ring depth, populated by populate() */
 	uint32_t                sq_entry_size = 0; /* SQ WQE bytes, populated by populate() */
+
+	/* Whether the provider QP echoes all 64 bits of a WQE's request id in its
+	 * completion (FI_EFA_WQ_CAPS_64_BIT_REQ_ID), populated by populate(). The
+	 * completion state reads this to choose between attributed and counted
+	 * completion tracking. */
+	bool                    has_64_bit_req_id = false;
 
 	/* GPU pointer to this endpoint's completed count: its FI_WRITE NIC counter
 	 * (set in the data/sc populate). The device reads it for SQ ring reuse and the
@@ -878,6 +894,38 @@ public:
 	 * CQ-overflow gate. */
 	uint32_t cq_depth() const { return host_cq_[0]->depth(); }
 
+	/**
+	 * Switch this state to counted completion tracking, for a NIC that does not
+	 * echo 64-bit request ids in its completions. Call once, after allocate() and
+	 * before the first progress().
+	 *
+	 * In this mode the progress pass takes each context's completed count from the
+	 * NIC counters of its posting endpoints, read through gdrcopy: every write ticks
+	 * exactly one poster's FI_WRITE/FI_READ counter, so their sum is the context's
+	 * completed count. The pass reads no completion queue and no request id, so it
+	 * publishes exact per-context counts but cannot attribute a completion to a
+	 * peer. It therefore advances a peer's ordered count only when it observes the
+	 * whole context drained, at which point every write admitted to every peer has
+	 * completed and each peer's ordered count equals its submitted count.
+	 * FlushAsync/Wait and put's signal-ordering wait complete under that rule
+	 * exactly as the blocking Flush does: once the context has no write in flight.
+	 *
+	 * @param submitted_per_peer_dev  device table of per-peer submitted counts,
+	 *                                context-major [nContexts * nranks]
+	 * @param poster_cntrs            per context, the GPU addresses of the NIC
+	 *                                counters of every endpoint that posts on it
+	 */
+	void set_counted_mode(uint32_t *submitted_per_peer_dev,
+			      const std::vector<std::vector<volatile uint64_t *>> &poster_cntrs);
+
+	/** True when set_counted_mode() has switched this state to counted tracking. */
+	bool counted_mode() const { return counted_; }
+
+	/** The per-peer window the device gates admission on. Counted mode publishes the
+	 * largest window so the gate never spins: the window bounds the per-peer
+	 * completion bitmap, and counted mode keeps none. */
+	uint32_t peer_window() const { return counted_ ? UINT32_MAX : NCCL_OFI_GDAKI_PEER_WINDOW; }
+
 	/** Drain every owned CQ (up to max_iter each) into this state and publish once.
 	 * Returns the publish status (0 when nothing moved). */
 	int progress(size_t max_iter);
@@ -904,6 +952,11 @@ public:
 private:
 	/* Advance one context's CQ into this state; progress() calls it per CQ. */
 	uint32_t progress_cq(gdaki_host_cq &cq, int ctx_id, size_t max_iter);
+
+	/* Counted-mode variants: the per-context count from the posters' NIC counters,
+	 * and the per-peer publish. */
+	bool progress_counters(int ctx_id);
+	bool publish_peers_when_drained();
 
 	/** Publish the whole host mirror to the device in one gdrcopy. Returns the
 	 * copy_to_device status so the caller reports a host-side fault. */
@@ -943,6 +996,30 @@ private:
 	 * only the derived counts land in the published mirror above. */
 	std::vector<std::array<uint64_t, NCCL_OFI_GDAKI_PEER_BITS_WORDS>> peer_bits;   /* [nContexts*nranks] */
 	std::vector<uint32_t> ordered_completed_count_per_peer;                        /* [nContexts*nranks] */
+
+	/* Counted mode. submitted_reg_ is one gdrcopy registration over the device's
+	 * context-major per-peer submitted table; a pass reads the whole table once into
+	 * submitted_snap_. The drained check for a context pairs the previous pass's
+	 * snapshot (submitted_prev_) and completed count (completed_prev_) with the
+	 * current snapshot. have_prev_ says a previous pass left them; check_pending_
+	 * says the previous pass consumed or published, so this pass owes a check.
+	 *
+	 * Each poster's NIC counter is a separate GPU allocation, so cntr_regs_ holds one
+	 * gdrcopy registration per counter and cntr_last_ its last 31-bit reading: the
+	 * NIC counter wraps at 2^31, and the pass accumulates the masked delta into the
+	 * 64-bit per-context count. */
+	bool counted_ = false;
+	nccl_ofi_device_copy::RegHandle *submitted_reg_ = nullptr;
+	std::vector<uint32_t> submitted_snap_;   /* [nContexts*nranks] */
+	std::vector<uint32_t> submitted_prev_;   /* [nContexts*nranks] */
+	std::vector<uint64_t> completed_prev_;   /* [nContexts] */
+	bool have_prev_ = false;
+	bool check_pending_ = false;
+	struct poster_cntr {
+		nccl_ofi_device_copy::RegHandle *reg = nullptr;
+		uint32_t last = 0;
+	};
+	std::vector<std::vector<poster_cntr>> cntr_regs_;   /* [nContexts][posters] */
 
 	/* The progress pass records the first errored host here, biased +1 (0 means
 	 * none), so queryLastError names the failing context. */
@@ -1050,8 +1127,9 @@ struct nccl_ofi_gin_gdaki_context {
 	 * writes to peer p across every QP of a logical context. Device-owned; the
 	 * post path's atomicAdd returns the write's position in that peer's sequence,
 	 * which lets a FlushAsync request carry a single number. The host allocates and
-	 * zeroes it. */
-	std::vector<std::unique_ptr<gdaki_gpu_buf<uint32_t>>> submitted_per_peer;   /* [nContexts][nranks] */
+	 * zeroes it. One contiguous table, context-major, so the completion state can
+	 * read every context's counts in one gdrcopy. */
+	std::unique_ptr<gdaki_gpu_buf<uint32_t>> submitted_per_peer;   /* [nContexts*nranks] */
 
 	/* Shared signal-only scratch buffer.
 	 *
