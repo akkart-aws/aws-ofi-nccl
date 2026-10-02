@@ -144,8 +144,14 @@ static struct fi_info *get_gdaki_info(struct fi_info *ref_info, uint64_t mode)
 	}
 	get_gdaki_hints(*hints, ref_info, mode);
 
+	/* Ask for 2.7 where the installed libfabric offers it: the EFA provider admits
+	 * a contextless efa-direct endpoint from 2.7 onwards, and requires FI_CONTEXT2
+	 * below it, so a mode-zero query at 2.5 returns -FI_ENODATA on every rail. */
 	struct fi_info *results = nullptr;
-	int ret = fi_getinfo(FI_VERSION(2, 5), nullptr, nullptr, 0ULL,
+	const uint32_t api_version = FI_VERSION_GE(fi_version(), FI_VERSION(2, 7))
+					     ? FI_VERSION(2, 7)
+					     : FI_VERSION(2, 5);
+	int ret = fi_getinfo(api_version, nullptr, nullptr, 0ULL,
 			     hints, &results);
 	fi_freeinfo(hints);
 	if (ret == -FI_ENODATA && mode == 0) {

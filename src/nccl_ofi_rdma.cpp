@@ -7280,7 +7280,17 @@ int nccl_net_ofi_rdma_init(const char *provider_filter,
 		       nccl_ofi_dmabuf_viable();
 #endif
 	if (gdaki_usable) {
-		api_version = FI_VERSION(2, 5);
+		/*
+		 * 2.5 is the hardware-counter ABI floor. The EFA provider populates the
+		 * work-queue capability field that carries FI_EFA_WQ_CAPS_64_BIT_REQ_ID
+		 * only for a fabric opened at 2.7 or later, and the GDA path reuses this
+		 * fabric (see the TODO above), so backendVersion 2 completion polling
+		 * needs 2.7 to observe that capability. Request 2.7 when the installed
+		 * libfabric provides it and 2.5 otherwise.
+		 */
+		api_version = FI_VERSION_GE(fi_version(), FI_VERSION(2, 7))
+				      ? FI_VERSION(2, 7)
+				      : FI_VERSION(2, 5);
 	} else {
 		api_version = nccl_ofi_dmabuf_viable() ? FI_VERSION(1, 20) : FI_VERSION(1, 18);
 	}

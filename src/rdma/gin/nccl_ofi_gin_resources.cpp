@@ -338,8 +338,11 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 
 	/*
 	 * Select libfabric API version:
-	 *   - GDA-capable EFA provider (GDAKI compiled in, DMA-BUF viable): 2.5,
-	 *     the hardware-counter ABI the GDAKI plugin reuses via fi_open_ops.
+	 *   - GDA-capable EFA provider (GDAKI compiled in, DMA-BUF viable): 2.7 where
+	 *     the installed libfabric offers it, and 2.5 otherwise. 2.5 is the
+	 *     hardware-counter ABI the GDAKI plugin reuses via fi_open_ops, and the
+	 *     EFA provider reports the work-queue capability field that carries
+	 *     FI_EFA_WQ_CAPS_64_BIT_REQ_ID only at 2.7 or later.
 	 *   - Otherwise (non-EFA / tcp / proxy-only build): 1.18 is sufficient;
 	 *     the GIN endpoint hints (FI_RX_CQ_DATA, cq_data_size = 4) don't use
 	 *     any 1.20+ features, so we avoid requesting a contract we don't
@@ -347,7 +350,9 @@ static inline struct fi_info *get_gin_info(struct fi_info *info)
 	 */
 	uint32_t api_version;
 	if (nccl_ofi_gin_gdaki_capable(info)) {
-		api_version = FI_VERSION(2, 5);
+		api_version = FI_VERSION_GE(fi_version(), FI_VERSION(2, 7))
+				      ? FI_VERSION(2, 7)
+				      : FI_VERSION(2, 5);
 	} else {
 		api_version = FI_VERSION(1, 18);
 	}
