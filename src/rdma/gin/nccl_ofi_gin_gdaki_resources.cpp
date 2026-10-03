@@ -566,22 +566,33 @@ void gdaki_endpoint::populate(int backend_version, struct fi_efa_ops_gda *gda_op
 	targets.populate(endpoint, all_addrs, ep_addr_len, total_slots, nranks, gda_ops);
 }
 
-void gdaki_data_endpoint::open(struct fid_domain *domain,
+void gdaki_data_endpoint::open(int backend_version,
+			       struct fid_domain *domain,
 			       struct fi_info *ref_info,
 			       struct fi_efa_ops_gda *gda_ops,
 			       struct fid_cq *cq,
 			       uint64_t cntr_flags,
 			       uint32_t inline_write_size)
 {
-	/* Create the counter first; it is bound to the inner endpoint between
-	 * open() and enable() and is this QP's per-QP completion source
-	 * (SQ ring reuse + blocking Flush). */
-	local_cntr.create(gda_ops, domain);
+	/* v1 reads this QP's completion from its own counter, so create the counter
+	 * first; it is bound to the inner endpoint between open() and enable().
+	 * v2 reads this QP's completion from the context's shared CQ, so it spends no
+	 * hardware counter here. Each counter also costs a CUDA VMM allocation rounded
+	 * up to the allocation granularity and a permanently-open dmabuf fd, on top of
+	 * the per-NIC counter budget. */
+	const bool want_local_cntr = (backend_version == NCCL_OFI_GDAKI_BACKEND_VERSION_1);
+	if (want_local_cntr) {
+		local_cntr.create(gda_ops, domain);
+	}
 
 	/* Open the inner endpoint without enable. */
 	base.endpoint.open(domain, ref_info, cq, inline_write_size);
 
-	base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
+	if (want_local_cntr) {
+		base.endpoint.bind(&local_cntr.get()->fid, cntr_flags);
+	} else {
+		(void)cntr_flags;
+	}
 	base.endpoint.enable();
 }
 

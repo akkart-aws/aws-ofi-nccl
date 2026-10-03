@@ -624,10 +624,14 @@ public:
 
 	/**
 	 * Open the inner endpoint, bind the v2 shared CQ or create the v1 private
-	 * CQ, create the local-completion counter, and bind it before enabling.
-	 * cntr_flags names the operations the counter counts.
+	 * CQ, and on v1 create the local-completion counter and bind it before
+	 * enabling. cntr_flags names the operations the counter counts.
+	 *
+	 * v2 drains this endpoint through the context's shared CQ, so it leaves
+	 * local_cntr unopened and spends no EFA hardware completion counter on it.
 	 */
-	void open(struct fid_domain *domain,
+	void open(int backend_version,
+		  struct fid_domain *domain,
 		  struct fi_info *ref_info,
 		  struct fi_efa_ops_gda *gda_ops,
 		  struct fid_cq *cq,

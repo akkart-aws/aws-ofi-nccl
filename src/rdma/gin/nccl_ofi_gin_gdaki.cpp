@@ -842,7 +842,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 
 			/* Put and Get carry their payload through the SGE, so the data
 			 * endpoint keeps the 64B entry and the full SQ depth. */
-			ctx->data[ctx_id]->open(ofi_domain,
+			ctx->data[ctx_id]->open(backend_version,
+						ofi_domain,
 						proxy_info,
 						gda_ops,
 						scq,
@@ -859,8 +860,8 @@ static ncclResult_t nccl_ofi_gin_gdaki_createContext(void *collComm, ncclGinConf
 			/* PutValue only writes. */
 			/* v2 carries PutValue inline and requests that payload capacity,
 			 * while v1 stages through an SGE and requests no inline data. */
-			ctx->pvdata[ctx_id]->open(
-				ofi_domain, proxy_info, gda_ops, scq, FI_WRITE, putvalue_inline_size);
+			ctx->pvdata[ctx_id]->open(backend_version, ofi_domain, proxy_info, gda_ops, scq,
+						  FI_WRITE, putvalue_inline_size);
 
 			/*
 			 * Step 5: Exchange ALL of this ctx's endpoint addresses in a
