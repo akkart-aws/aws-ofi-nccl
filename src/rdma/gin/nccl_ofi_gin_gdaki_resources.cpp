@@ -606,19 +606,31 @@ void gdaki_data_endpoint::populate(int backend_version, struct fi_efa_ops_gda *g
 }
 
 void gdaki_sc_endpoint::open(struct fid_domain *domain, struct fi_info *ref_info,
-			     struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq)
+			     struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq,
+			     bool want_write_cntr, bool want_remote_write_cntr)
 {
 	/* Create hardware counters first; they will be bound to the inner
-	 * endpoint between open() and enable(). */
-	write_cntr.create(gda_ops, domain);
-	remote_write_cntr.create(gda_ops, domain);
+	 * endpoint between open() and enable(). This endpoint creates the counter
+	 * for each role it fills: a counter endpoint reports its own posts through
+	 * FI_WRITE, and a signal endpoint reports a peer's arrivals through
+	 * FI_REMOTE_WRITE. */
+	if (want_write_cntr) {
+		write_cntr.create(gda_ops, domain);
+	}
+	if (want_remote_write_cntr) {
+		remote_write_cntr.create(gda_ops, domain);
+	}
 
 	/* Bind the v2 shared CQ or create the v1 private CQ, without enable. */
 	base.endpoint.open(domain, ref_info, cq, /* inline_write_size */ 0);
 
 	/* Bind counters before enabling. */
-	base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
-	base.endpoint.bind(&remote_write_cntr.get()->fid, FI_REMOTE_WRITE);
+	if (want_write_cntr) {
+		base.endpoint.bind(&write_cntr.get()->fid, FI_WRITE);
+	}
+	if (want_remote_write_cntr) {
+		base.endpoint.bind(&remote_write_cntr.get()->fid, FI_REMOTE_WRITE);
+	}
 
 	base.endpoint.enable();
 }

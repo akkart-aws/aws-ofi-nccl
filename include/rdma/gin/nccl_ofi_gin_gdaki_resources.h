@@ -694,9 +694,20 @@ public:
 	 * Open the inner endpoint with hardware counters bound. Creates
 	 * the counters, opens the inner EP without enable, binds the
 	 * counters, then enables.
+	 *
+	 * An endpoint serves slot i of this context, which createContext uses as
+	 * counter i while i < nCounters and as signal i while i < nSignals, so the
+	 * two roles are requested independently. want_write_cntr asks for the
+	 * FI_WRITE counter that a counter endpoint reports its own posts through,
+	 * and want_remote_write_cntr asks for the FI_REMOTE_WRITE counter that a
+	 * peer's waitSignal observes. An endpoint filling one role creates one
+	 * counter, which is what keeps a lopsided request such as
+	 * createContext(nCounters=4, nSignals=10) at 14 EFA hardware completion
+	 * counters per context rather than 20.
 	 */
 	void open(struct fid_domain *domain, struct fi_info *ref_info,
-		  struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq);
+		  struct fi_efa_ops_gda *gda_ops, struct fid_cq *cq,
+		  bool want_write_cntr, bool want_remote_write_cntr);
 
 	/**
 	 * Populate the inner endpoint's GPU descriptors, build the
